@@ -198,6 +198,79 @@ async def setup_repository_endpoint(request: RepositorySetupRequest, apikey: Opt
     )
 
 
+@app.post("/v1/code-rag/query")
+async def query_repository(request: QueryRequest, apikey: Optional[str] = Depends(oauth2_scheme)):
+
+    """
+    Queries an already set up repository and non-streams the LLM's response.
+    """
+    repo_id = request.repo_id.replace("/", "_").replace(":", "_") # Sanitize
+    logger.info(f"Received query for repo_id: '{repo_id}', query: '{request.query_text[:50]}...'")
+
+    try:
+        pipeline = RAGPipeline(repo_id=repo_id, indexes=request.indexes)
+        if not pipeline.retriever.vector_index and not pipeline.retriever.bm25_index:
+            # This means _load_indexes inside HybridRetriever failed to find existing indexes
+            raise HTTPException(status_code=404, detail=f"Repository with repo_id '{repo_id}' not found or not indexed. Please set it up first.")
+        logger.info(f"Dynamically loaded RAGPipeline for repo_id: {repo_id} for query.")
+    except Exception as e:
+        logger.error(f"Failed to dynamically load RAGPipeline for {repo_id}: {e}")
+        raise HTTPException(status_code=404, detail=f"Repository with repo_id '{repo_id}' not found or not indexed. Please set it up first.")
+
+
+    # 1. Retrieve context chunks
+    try:
+        # The query method in RAGPipeline is synchronous.
+        # For a truly non-blocking API, this should also be run in a threadpool.
+        # from starlette.concurrency import run_in_threadpool
+        # context_chunks_meta = await run_in_threadpool(
+        #     pipeline.query,
+        #     query_text=request.query_text,
+        #     top_n_final=request.top_n_final
+        # )
+        retriever_query = request.query_text
+        if request.rewrite_query:
+            retriever_query = request.rewrite_query
+        elif request.rewrite_prompt:
+            retriever_query = await pipeline.retriever.rewrite_query(sys_prompt=request.rewrite_prompt, user_query=request.query_text, apikey=apikey)
+        context_chunks_meta: List[Dict[str, Any]] = pipeline.query(
+            query_text=retriever_query,
+            top_n_final=request.top_n_final,
+            vector_top_k=request.vector_top_k,
+            bm25_top_k=request.bm25_top_k,
+            apikey=apikey
+        )
+        logger.info(f"Retrieved {len(context_chunks_meta)} context chunks for query.")
+
+    except Exception as e:
+        logger.error(f"Error during retrieval for repo_id {repo_id}: {e}")
+        logger.exception("Retrieval exception:")
+        raise HTTPException(status_code=500, detail=f"Error retrieving context: {str(e)}")
+
+    # 2. Initialize LLM Generator (uses settings from config.py by default)
+    try:
+        llm_generator = LLMGenerator() # Uses defaults from config.py
+    except Exception as e:
+        logger.error(f"Failed to initialize LLMGenerator: {e}")
+        raise HTTPException(status_code=500, detail=f"LLM Generator initialization error: {str(e)}")
+
+    # 3. Stream response from LLM
+    try:
+        response = await llm_generator.generate_response_non_streaming(
+            apikey=apikey,
+            sys_prompy=request.sys_prompt,
+            user_query=request.query_text,
+            context_chunks=context_chunks_meta
+        )
+        return response
+    except Exception as e:
+        logger.error(f"Error during LLM response generation for repo_id {repo_id}: {e}")
+        logger.exception("LLM generation exception:")
+        # Note: If the error happens inside the async generator, it might be harder to catch here.
+        # The generator itself should handle internal errors and yield error messages if possible.
+        raise HTTPException(status_code=500, detail=f"Error generating LLM response: {str(e)}")
+
+
 @app.post("/v1/code-rag/query/stream")
 async def query_repository_stream(request: QueryRequest, apikey: Optional[str] = Depends(oauth2_scheme)) -> StreamingResponse:
 
