@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -9,40 +10,92 @@ from loguru import logger
 from src import config
 from src.data_processing.chunkers import DocumentChunk  # Pydantic model for chunks
 
+
+def _process_batch(batch_info: Tuple[int, List[str]], model_name: str, dimensions: int, apikey: Optional[str]) -> Tuple[int, Optional[List[List[float]]]]:
+    """
+    Process a single batch of texts and return embeddings with batch index for ordering.
+    """
+    batch_idx, batch_texts = batch_info
+    try:
+        client = config.get_openai_embeddings_client(apikey=apikey)
+        response = client.embeddings.create(
+            input=batch_texts,
+            model=model_name,
+            encoding_format="float",
+            dimensions=dimensions
+        )
+        batch_embeddings = [item.embedding for item in response.data]
+        logger.debug(f"Generated embeddings for batch {batch_idx + 1}")
+        return batch_idx, batch_embeddings
+    except Exception as e:
+        logger.error(f"Error generating OpenAI embeddings for batch {batch_idx + 1}: {e}")
+        return batch_idx, None
+
+
 def generate_embeddings(
         texts: List[str],
         model_name: str = config.EMBEDDING_MODEL_NAME,
         batch_size: int = config.EMBEDDING_BATCH_SIZE,
         dimensions: int = config.EMBEDDING_DIMENSIONS,
-        apikey: Optional[str] = None
+        apikey: Optional[str] = None,
+        max_workers: int = 10
 ) -> Optional[np.ndarray]:
     """
-    Generates embeddings for a list of texts using the configured provider.
+    Generates embeddings for a list of texts using the configured provider with parallel processing.
+
+    Args:
+        texts: List of texts to generate embeddings for
+        model_name: Name of the embedding model to use
+        batch_size: Size of each batch for API requests
+        dimensions: Dimension of the embeddings
+        apikey: API key for authentication
+        max_workers: Maximum number of threads for parallel processing
+
+    Returns:
+        NumPy array of embeddings or None if failed
     """
     if not texts:
         return np.array([])
 
-    logger.info(f"Generating embeddings for {len(texts)} texts using {model_name} (batch size: {batch_size}).")
+    logger.info(f"Generating embeddings for {len(texts)} texts using {model_name} (batch size: {batch_size}, threads: {max_workers}).")
 
-    client = config.get_openai_embeddings_client(apikey = apikey)
-    all_embeddings = []
+    # Create batches with indices for maintaining order
+    batches = []
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
-        try:
-            response = client.embeddings.create(
-                input=batch_texts,
-                model=model_name,
-                encoding_format="float",
-                dimensions=dimensions # some models support this
-            )
-            batch_embeddings = [item.embedding for item in response.data]
-            all_embeddings.extend(batch_embeddings)
-            logger.debug(f"Generated embeddings for batch {i//batch_size + 1}")
-        except Exception as e:
-            logger.error(f"Error generating OpenAI embeddings for batch: {e}")
-            # Decide on error handling: skip batch, return None, or raise
-            return None # Or handle more gracefully
-    embeddings_list = all_embeddings
+        batches.append((i // batch_size, batch_texts))
+
+    # Process batches in parallel using ThreadPoolExecutor
+    all_embeddings = [None] * len(batches)  # Pre-allocate to maintain order
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all batch processing tasks
+        future_to_batch = {
+            executor.submit(_process_batch, batch_info, model_name, dimensions, apikey): batch_info[0]
+            for batch_info in batches
+        }
+
+        # Collect results and maintain order
+        for future in as_completed(future_to_batch):
+            batch_idx = future_to_batch[future]
+            try:
+                result_batch_idx, batch_embeddings = future.result()
+                if batch_embeddings is not None:
+                    all_embeddings[result_batch_idx] = batch_embeddings
+                else:
+                    logger.error(f"Failed to generate embeddings for batch {result_batch_idx + 1}")
+                    return None
+            except Exception as e:
+                logger.error(f"Exception in batch processing: {e}")
+                return None
+
+    # Flatten the results while maintaining order
+    embeddings_list = []
+    for batch_embeddings in all_embeddings:
+        if batch_embeddings is None:
+            logger.error("One or more batches failed to generate embeddings")
+            return None
+        embeddings_list.extend(batch_embeddings)
 
     if not embeddings_list:
         logger.warning("No embeddings were generated.")
@@ -96,7 +149,7 @@ class FaissVectorIndex:
         logger.info(f"Building FAISS index with {len(chunks)} chunks...")
         chunk_texts = [chunk.content for chunk in chunks]
 
-        embeddings = generate_embeddings(chunk_texts, model_name=self.model, batch_size=self.batch_size, dimensions=self.embedding_dim, apikey=apikey)
+        embeddings = generate_embeddings(chunk_texts, model_name=self.model, batch_size=self.batch_size, dimensions=self.embedding_dim, apikey=apikey, max_workers=10)
 
         if embeddings is None or embeddings.shape[0] == 0:
             logger.error("Failed to generate embeddings. Index not built.")
@@ -197,7 +250,7 @@ class FaissVectorIndex:
 
 
         logger.debug(f"Searching index for query: '{query_text[:50]}...' (top_k={top_k})")
-        query_embedding = generate_embeddings(texts =[query_text], apikey=apikey, model_name=model, batch_size=batch_size, dimensions=dimensions)
+        query_embedding = generate_embeddings(texts=[query_text], apikey=apikey, model_name=model, batch_size=batch_size, dimensions=dimensions, max_workers=1)
 
         if query_embedding is None or query_embedding.shape[0] == 0:
             logger.error("Failed to generate embedding for query. Search aborted.")

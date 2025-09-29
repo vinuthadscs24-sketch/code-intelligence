@@ -118,10 +118,17 @@ def is_file_excluded(
     # Check against excluded directories
     for excluded_dir_pattern in excluded_dirs:
         # Simple check: if any part of the path matches the excluded dir pattern
-        # More sophisticated matching (e.g. glob) can be added if needed
         if excluded_dir_pattern in relative_file_path.parts:
             return True
-        try: # Try glob matching for patterns like '*/test/*'
+
+        # Handle patterns like '*/test/*' and '*/resources/*'
+        if excluded_dir_pattern.startswith("*/") and excluded_dir_pattern.endswith("/*"):
+            dir_name = excluded_dir_pattern.strip("*/")
+            if dir_name in relative_file_path.parts:
+                return True
+
+        # Handle other glob patterns
+        try:
             if relative_file_path.match(f"*{os.sep}{excluded_dir_pattern}{os.sep}*") or \
                     relative_file_path.match(f"{excluded_dir_pattern}{os.sep}*"):
                 return True
@@ -228,19 +235,20 @@ def load_documents_from_repo(
 
             # File exclusion check
             if is_file_excluded(relative_file_path, _excluded_dirs, _excluded_files):
-                logger.trace(f"Skipping (excluded): {relative_file_path}")
+                logger.debug(f"Skipping (excluded): {relative_file_path}")
                 skipped_files_count += 1
                 continue
+
 
             # File size check
             try:
                 file_size_bytes = absolute_file_path.stat().st_size
                 if file_size_bytes == 0:
-                    logger.trace(f"Skipping (empty file): {relative_file_path}")
+                    logger.debug(f"Skipping (empty file): {relative_file_path}")
                     skipped_files_count += 1
                     continue
                 if file_size_bytes > _max_size_bytes:
-                    logger.trace(f"Skipping (too large: {file_size_bytes / (1024*1024):.2f}MB): {relative_file_path}")
+                    logger.debug(f"Skipping (too large: {file_size_bytes / (1024*1024):.2f}MB): {relative_file_path}")
                     skipped_files_count += 1
                     continue
             except FileNotFoundError:
@@ -274,7 +282,7 @@ def load_documents_from_repo(
                 if processed_files_count % 100 == 0:
                     logger.info(f"Processed {processed_files_count} files so far...")
             else:
-                logger.trace(f"Skipping (unsupported extension or no content): {relative_file_path}")
+                logger.debug(f"Skipping (unsupported extension or no content): {relative_file_path}")
                 skipped_files_count += 1
 
     logger.info(f"Finished loading documents. Processed: {processed_files_count}, Skipped: {skipped_files_count}")
