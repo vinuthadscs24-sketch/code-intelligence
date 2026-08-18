@@ -1,0 +1,17 @@
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+
+# Project Workspace & Generated Files
+workspace/
+*.graphml
+*.index
+
+# IDE Settings
+.vscode/
+.idea/
