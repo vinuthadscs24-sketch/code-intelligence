@@ -1,62 +1,72 @@
 import sys
-from scanner import RepositoryScanner
-from parser import JavaASTParser
-from extractor import JavaSymbolExtractor
-from graph_builder import CodeKnowledgeGraph
+import argparse
+from pathlib import Path
+
+from parser import JavaASTParser 
+from chunker import CodeChunker
+from vector_store import VectorStore
 
 def main():
-    target_repo = sys.argv[1] if len(sys.argv) > 1 else "https://github.com/SimpleProgramming/simple-springboot-app.git"
+    cli_parser = argparse.ArgumentParser(description="Codebase Vector Search Engine")
+    cli_parser.add_argument(
+        "repo_path", 
+        nargs="?", 
+        default=None, 
+        help="Path to the repository directory to analyze"
+    )
+    args = cli_parser.parse_args()
 
-    # 1. Scan
-    scanner = RepositoryScanner(target_repo)
-    repo_path = scanner.prepare_repository()
-    java_files = scanner.scan_java_files(repo_path)
+    # Prompt user for path if not provided via command line argument
+    if not args.repo_path:
+        repo_input = input("Enter path to Java repository: ").strip()
+        repo_path = Path(repo_input)
+    else:
+        repo_path = Path(args.repo_path)
 
-    # 2. Parse & Extract
-    ast_parser = JavaASTParser()
-    extractor = JavaSymbolExtractor(ast_parser)
+    if not repo_path.exists() or not repo_path.is_dir():
+        print(f"Error: Directory '{repo_path}' does not exist.")
+        sys.exit(1)
 
+    print(f"[1/3] Parsing repository at '{repo_path}' and extracting code data...")
+    parser = JavaASTParser()
     extracted_data = []
-    for file_path in java_files:
-        tree, source_code = ast_parser.parse_file(file_path)
-        symbols = extractor.extract_symbols(tree.root_node, source_code)
-        extracted_data.append((file_path, symbols))
 
-    # 3. Build Enhanced Knowledge Graph
-    kg = CodeKnowledgeGraph()
-    kg.build_graph(repo_path.name, extracted_data)
+    for java_file in repo_path.rglob("*.java"):
+        parsed_tree = parser.parse_file(str(java_file))
+        if parsed_tree:
+            extracted_data.append((str(java_file), parsed_tree))
 
-    # 4. Print Summary
-    summary = kg.get_summary()
+    if not extracted_data:
+        print(f"No Java files found in '{repo_path}'.")
+        sys.exit(1)
 
-    print("\n==========================================")
-    print("   Spring-Aware Knowledge Graph Built     ")
-    print("==========================================")
-    print(f"Target Repo : {repo_path.name}")
-    print(f"Total Nodes : {summary['total_nodes']}")
-    print(f"Total Edges : {summary['total_edges']}")
-    
-    print("\nNode Types:")
-    for ntype, count in summary["node_types"].items():
-        print(f"  ├── {ntype}: {count}")
+    print(f"Parsed {len(extracted_data)} Java files.")
 
-    print("\nEdge Relationships:")
-    for rel, count in summary["relationship_types"].items():
-        print(f"  ├── {rel}: {count}")
-    print("==========================================\n")
+    print("[2/3] Generating scoped AST chunks...")
+    chunker = CodeChunker()
+    chunks = chunker.create_chunks(extracted_data)
+    print(f"Total Chunks Created: {len(chunks)}")
 
-    # 5. Export GraphML
-    kg.export_graphml("workspace/code_graph.graphml")
+    print("[3/3] Building FAISS Vector Index...")
+    store = VectorStore()
+    store.build_index(chunks)
 
-    # 6. Deep Inspection on Spring Controllers & Services
-    sample_classes = ["AutowiredController", "StudentController", "StudentConfig"]
-    for cls in sample_classes:
-        deps = kg.inspect_class_dependencies(cls)
-        if "error" not in deps:
-            print(f"\n🔍 Inspection for '{cls}':")
-            for rel, targets in deps["relationships"].items():
-                if targets:
-                    print(f"   ├── {rel}: {targets}")
+    print("\n--- FAISS Vector Search Ready ---")
+    while True:
+        try:
+            query = input("\nEnter search query (or 'exit' to quit): ").strip()
+            if not query or query.lower() == 'exit':
+                break
+
+            results = store.search(query, top_k=3)
+            print(f"\nTop matches for '{query}':")
+            for rank, (chunk, score) in enumerate(results, start=1):
+                print(f"\n[{rank}] Score: {score:.4f} | ID: {chunk['chunk_id']}")
+                print(f"    Type: {chunk['chunk_type']} | File: {Path(chunk['file_name']).name}")
+                print(f"    Annotations: {chunk['annotations']}")
+                print(f"    Code Snippet:\n{chunk['code_content'][:200]}...\n")
+        except KeyboardInterrupt:
+            break
 
 if __name__ == "__main__":
     main()
