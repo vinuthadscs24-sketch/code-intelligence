@@ -5,7 +5,8 @@ from sentence_transformers import SentenceTransformer
 class VectorStore:
     def __init__(self, model_name="all-MiniLM-L6-v2"):
         self.model = SentenceTransformer(model_name)
-        self.dimension = self.model.get_sentence_embedding_dimension()
+        # Change this line in src/vector_store.py:
+        self.dimension = self.model.get_embedding_dimension()
         self.index = faiss.IndexFlatIP(self.dimension)
         self.chunks = []
 
@@ -15,20 +16,19 @@ class VectorStore:
             return
 
         self.chunks = chunks
-        
-        # Construct rich text representation combining metadata and code
         texts = []
         for c in chunks:
             class_name = c.get("class_name") or ""
             method_name = c.get("method_name") or ""
             annotations = " ".join(c.get("annotations", []))
+            calls = " ".join(c.get("calls", []))
             code = c.get("code_content") or ""
             
-            # Semantic text optimized for vector representation
-            text_repr = f"Class: {class_name} Method: {method_name} Annotations: {annotations}\n{code}".strip()
+            # Build semantic representation combining metadata and code
+            text_repr = f"Class: {class_name} Method: {method_name} Annotations: {annotations} Calls: {calls}\n{code}".strip()
             texts.append(text_repr)
 
-        # Generate embeddings and normalize for cosine similarity via IndexFlatIP
+        # Generate embeddings and normalize for inner product (cosine similarity)
         embeddings = self.model.encode(texts, show_progress_bar=False)
         embeddings = np.array(embeddings).astype("float32")
         faiss.normalize_L2(embeddings)
