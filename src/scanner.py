@@ -1,36 +1,49 @@
 import os
-import shutil
+import re
 from pathlib import Path
+from urllib.parse import urlparse
 from git import Repo
 
 class RepositoryScanner:
-    def __init__(self, repo_input: str, workspace_dir: str = "./workspace"):
-        self.repo_input = repo_input
+    def __init__(self, repo_input: str, workspace_dir: str = "workspace"):
+        # 1. Strip Markdown link syntax [text](url) or <url>
+        clean_str = re.sub(r'\[.*?\]\((.*?)\)', r'\1', repo_input.strip())
+        clean_str = clean_str.strip('<> ')
+
+        # 2. Parse URL and strip tracking query strings (?utm_source=...)
+        parsed = urlparse(clean_str)
+        if parsed.scheme in ["http", "https"]:
+            self.repo_input = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        else:
+            self.repo_input = clean_str
+
         self.workspace_dir = Path(workspace_dir)
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
     def prepare_repository(self) -> Path:
-        """Clones a remote GitHub URL or returns a validated local directory path."""
-        if self.repo_input.startswith("http://") or self.repo_input.startswith("https://"):
-            repo_name = self.repo_input.rstrip("/").split("/")[-1].replace(".git", "")
-            target_path = self.workspace_dir / repo_name
-            
-            if target_path.exists():
-                print(f"[Scanner] Repository already cached at: {target_path}")
-                return target_path
+        if os.path.exists(self.repo_input):
+            return Path(self.repo_input)
 
-            print(f"[Scanner] Cloning remote repository: {self.repo_input} ...")
-            Repo.clone_from(self.repo_input, target_path, depth=50)
+        if not self.repo_input.startswith(("http://", "https://")):
+            raise FileNotFoundError(f"Invalid local path or URL: {self.repo_input}")
+
+        repo_name = self.repo_input.rstrip("/").split("/")[-1].replace(".git", "")
+        target_path = self.workspace_dir / repo_name
+
+        if target_path.exists():
+            print(f"[Scanner] Repository already cached at: {target_path}")
             return target_path
-        
-        local_path = Path(self.repo_input)
-        if not local_path.exists():
-            raise FileNotFoundError(f"Local path does not exist: {local_path}")
-        return local_path
 
-    def scan_java_files(self, target_path: Path) -> list[Path]:
-        """Finds all .java source files while ignoring build and test directories."""
-        java_files = [
-            p for p in target_path.rglob("*.java")
-            if "test" not in p.parts and "target" not in p.parts and "build" not in p.parts
-        ]
+        print(f"[Scanner] Cloning remote repository: {self.repo_input} ...")
+        Repo.clone_from(self.repo_input, target_path, depth=50)
+        return target_path
+
+    def scan_java_files(self, repo_path: Path) -> list[Path]:
+        java_files = []
+        for root, _, files in os.walk(repo_path):
+            if any(ignore in root for ignore in ["test", "target", "build", ".git"]):
+                continue
+            for file in files:
+                if file.endswith(".java"):
+                    java_files.append(Path(root) / file)
         return java_files

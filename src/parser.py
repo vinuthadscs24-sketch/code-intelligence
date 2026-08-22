@@ -1,27 +1,50 @@
-from pathlib import Path
-import tree_sitter_java as tsjava
-from tree_sitter import Language, Parser, Tree, Node
+import javalang
+from typing import Dict, Any, Optional
 
 class JavaASTParser:
-    def __init__(self):
-        # Initialize Java language binding for Tree-sitter
-        self.JAVA_LANGUAGE = Language(tsjava.language())
-        self.parser = Parser(self.JAVA_LANGUAGE)
+    def parse_file(self, file_path: str) -> Optional[Dict[str, Any]]:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                code = f.read()
+            
+            tree = javalang.parse.parse(code)
+            return {"file_path": file_path, "tree": tree, "source_code": code}
+        except Exception as e:
+            print(f"Error parsing {file_path}: {e}")
+            return None
 
-    def parse_file(self, file_path: Path) -> tuple[Tree, bytes]:
-        """Reads a Java file and returns its Concrete Syntax Tree along with source bytes."""
-        with open(file_path, "rb") as f:
-            source_code = f.read()
-        
-        tree = self.parser.parse(source_code)
-        return tree, source_code
+    def extract_symbols_and_relations(self, tree, source_code: str):
+        methods_data = []
 
-    @staticmethod
-    def get_node_text(node: Node, source_code: bytes) -> str:
-        """Extracts the exact source code string corresponding to an AST node."""
-        return source_code[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+        for path, node in tree.filter(javalang.tree.ClassDeclaration):
+            class_name = node.name
+            implements_list = [impl.name for impl in node.implements] if node.implements else []
 
-    @staticmethod
-    def find_children_of_type(node: Node, type_name: str) -> list[Node]:
-        """Utility to find all direct children of a specific syntax node type."""
-        return [child for child in node.children if child.type == type_name]
+            for method in node.methods:
+                method_name = method.name
+                param_types = [p.type.name for p in method.parameters] if method.parameters else []
+                param_str = ",".join(param_types)
+                signature = f"{method_name}({param_str})"
+
+                calls = set()
+                instantiates = set()
+
+                if method.body:
+                    for _, sub_node in method.filter(javalang.tree.MethodInvocation):
+                        calls.add(sub_node.member)
+                    for _, sub_node in method.filter(javalang.tree.ClassInstanceCreation):
+                        if hasattr(sub_node.type, "name"):
+                            instantiates.add(sub_node.type.name)
+
+                methods_data.append({
+                    "class_name": class_name,
+                    "method_name": method_name,
+                    "signature": signature,
+                    "implements": implements_list,
+                    "relationships": {
+                        "CALLS": sorted(list(calls)),
+                        "INSTANTIATES": sorted(list(instantiates))
+                    }
+                })
+
+        return methods_data

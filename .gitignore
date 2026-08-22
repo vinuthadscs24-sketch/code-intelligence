@@ -15,3 +15,6 @@ workspace/
 # IDE Settings
 .vscode/
 .idea/
+temp_audit_repo/
+debug_parser.py
+test_parser_audit.py
