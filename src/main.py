@@ -2,7 +2,7 @@ import sys
 import argparse
 from pathlib import Path
 
-from src.parser import JavaASTParser 
+from src.parser import JavaASTParser
 from src.chunker import CodeChunker
 from src.vector_store import VectorStore
 from src.graph_builder import CodeKnowledgeGraph
@@ -18,8 +18,8 @@ def main():
     args = cli_parser.parse_args()
 
     if not args.repo_path:
-        repo_input = input("Enter path to Java repository (default: ./temp_audit_repo): ").strip()
-        repo_path = Path(repo_input) if repo_input else Path("./temp_audit_repo")
+        repo_input = input("Enter path to Java repository (default: .): ").strip()
+        repo_path = Path(repo_input) if repo_input else Path(".")
     else:
         repo_path = Path(args.repo_path)
 
@@ -32,14 +32,17 @@ def main():
     extracted_data = []
 
     for java_file in repo_path.rglob("*.java"):
-        result = parser.parse_file(str(java_file))
-        if result:
-            if isinstance(result, dict):
-                extracted_data.append((Path(java_file), result))
-            elif isinstance(result, (tuple, list)):
-                tree = result[0]
-                source_code = result[1] if len(result) > 1 else ""
-                extracted_data.append((Path(java_file), {"tree": tree, "source_code": source_code}))
+        try:
+            result = parser.parse_file(str(java_file))
+            if result:
+                if isinstance(result, dict):
+                    extracted_data.append((Path(java_file), result))
+                elif isinstance(result, (tuple, list)):
+                    tree = result[0]
+                    source_code = result[1] if len(result) > 1 else ""
+                    extracted_data.append((Path(java_file), {"tree": tree, "source_code": source_code}))
+        except Exception as e:
+            print(f"[Warning] Skipping '{java_file}' due to parse error: {e}")
 
     if not extracted_data:
         print(f"No Java files found or successfully parsed in '{repo_path}'.")
@@ -75,11 +78,12 @@ def main():
             results = store.search(query, top_k=3)
             print(f"\nTop matches for '{query}':")
             
-            for rank, (chunk, score) in enumerate(results, start=1):
+            # Corrected unpacking: VectorStore returns (score, chunk)
+            for rank, (score, chunk) in enumerate(results, start=1):
                 chunk_id = chunk.get("chunk_id", "Unknown ID")
                 chunk_type = chunk.get("chunk_type", "METHOD")
                 file_name = Path(chunk.get("file_name", "unknown")).name
-                annotations = chunk.get("annotations", "[]")
+                annotations = chunk.get("annotations", [])
                 code_snippet = chunk.get("code_content", "")[:200]
                 method_name = chunk.get("method_name", "")
 

@@ -9,7 +9,7 @@ class VectorStore:
         self.index = faiss.IndexFlatIP(self.dimension)
         self.chunks = []
 
-    def build_index(self, chunks):
+    def build_index(self, chunks, batch_size=128):
         if not chunks:
             print("[VectorStore] Warning: No chunks to index.")
             return
@@ -23,17 +23,16 @@ class VectorStore:
             calls = " ".join(c.get("calls", []))
             code = c.get("code_content") or ""
             
-            # Rich semantic string combining code and metadata
             text_repr = f"Class: {class_name} Method: {method_name} Annotations: {annotations} Calls: {calls}\n{code}".strip()
             texts.append(text_repr)
 
-        # Generate embeddings and normalize for cosine similarity / IndexFlatIP
-        embeddings = self.model.encode(texts, show_progress_bar=False)
+        print(f"[VectorStore] Generating embeddings for {len(texts)} chunks (batch size {batch_size})...")
+        embeddings = self.model.encode(texts, batch_size=batch_size, show_progress_bar=True)
         embeddings = np.array(embeddings).astype("float32")
         faiss.normalize_L2(embeddings)
 
         self.index.add(embeddings)
-        print(f"[VectorStore] Indexed {len(chunks)} chunks with dimension {self.dimension}.")
+        print(f"[VectorStore] Successfully indexed {len(chunks)} chunks into FAISS IndexFlatIP.")
 
     def search(self, query, top_k=3):
         if self.index.ntotal == 0:
