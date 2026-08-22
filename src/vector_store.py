@@ -1,48 +1,53 @@
 import faiss
 import numpy as np
-from typing import List, Dict, Any, Tuple
 from sentence_transformers import SentenceTransformer
 
 class VectorStore:
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, model_name="all-MiniLM-L6-v2"):
         self.model = SentenceTransformer(model_name)
-        self.index = None
+        self.dimension = self.model.get_sentence_embedding_dimension()
+        self.index = faiss.IndexFlatIP(self.dimension)
         self.chunks = []
 
-    def _get_text(self, chunk: Dict[str, Any]) -> str:
-        if "text_representation" in chunk and chunk["text_representation"]:
-            return chunk["text_representation"]
-        if "code_content" in chunk and chunk["code_content"]:
-            return chunk["code_content"]
-        return chunk.get("source_code", str(chunk))
-
-    def build_index(self, chunks: List[Dict[str, Any]]):
-        self.chunks = chunks
+    def build_index(self, chunks):
         if not chunks:
+            print("[VectorStore] Warning: No chunks to index.")
             return
 
-        texts = [self._get_text(c) for c in chunks]
-        embeddings = self.model.encode(texts, show_progress_bar=False)
+        self.chunks = chunks
         
-        # Normalize vectors for cosine similarity (IndexFlatIP)
-        faiss.normalize_L2(embeddings)
-        
-        dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dimension)
-        self.index.add(np.array(embeddings).astype("float32"))
-        print(f"[VectorStore] Indexed {len(chunks)} chunks with dimension {dimension}.")
+        # Construct rich text representation combining metadata and code
+        texts = []
+        for c in chunks:
+            class_name = c.get("class_name") or ""
+            method_name = c.get("method_name") or ""
+            annotations = " ".join(c.get("annotations", []))
+            code = c.get("code_content") or ""
+            
+            # Semantic text optimized for vector representation
+            text_repr = f"Class: {class_name} Method: {method_name} Annotations: {annotations}\n{code}".strip()
+            texts.append(text_repr)
 
-    def search(self, query: str, top_k: int = 3) -> List[Tuple[Dict[str, Any], float]]:
-        if not self.index or len(self.chunks) == 0:
+        # Generate embeddings and normalize for cosine similarity via IndexFlatIP
+        embeddings = self.model.encode(texts, show_progress_bar=False)
+        embeddings = np.array(embeddings).astype("float32")
+        faiss.normalize_L2(embeddings)
+
+        self.index.add(embeddings)
+        print(f"[VectorStore] Indexed {len(chunks)} chunks with dimension {self.dimension}.")
+
+    def search(self, query, top_k=3):
+        if self.index.ntotal == 0:
             return []
 
-        query_vector = self.model.encode([query])
+        query_vector = self.model.encode([query]).astype("float32")
         faiss.normalize_L2(query_vector)
-        
-        distances, indices = self.index.search(np.array(query_vector).astype("float32"), top_k)
+
+        scores, indices = self.index.search(query_vector, top_k)
         
         results = []
-        for idx, score in zip(indices[0], distances[0]):
+        for score, idx in zip(scores[0], indices[0]):
             if idx != -1 and idx < len(self.chunks):
-                results.append((self.chunks[idx], float(score)))
+                results.append((float(score), self.chunks[idx]))
+
         return results
