@@ -7,8 +7,8 @@ from typing import Dict, Any, List, Optional
 
 class GitIntelligence:
     """
-    Interfaces with Git CLI to attach commit metadata, diffs, 
-    and author history to AST method boundaries.
+    Interfaces with Git CLI to attach commit metadata, file-targeted diffs, 
+    and historical evolution tracking to AST method boundaries.
     """
     def __init__(self, repo_path: str):
         self.repo_path = os.path.abspath(repo_path)
@@ -25,7 +25,7 @@ class GitIntelligence:
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
-                errors="replace",  # Prevents Windows cp1252 decode crashes
+                errors="replace",
                 check=True
             )
             return (result.stdout or "").strip()
@@ -33,9 +33,7 @@ class GitIntelligence:
             return f"Git error: {(e.stderr or '').strip()}"
 
     def get_method_blame(self, relative_file_path: str, start_line: int, end_line: int) -> List[Dict[str, Any]]:
-        """
-        Runs line-bounded git blame across an AST method's exact line range.
-        """
+        """Runs line-bounded git blame across an AST method's line range."""
         raw_blame = self._run_git([
             "blame",
             f"-L{start_line},{end_line}",
@@ -45,7 +43,6 @@ class GitIntelligence:
         ])
 
         if raw_blame.startswith("Git error"):
-            print(f"Error executing blame: {raw_blame}")
             return []
 
         commits: Dict[str, Dict[str, Any]] = {}
@@ -53,7 +50,7 @@ class GitIntelligence:
         
         for line in raw_blame.split("\n"):
             parts = line.split(" ")
-            if len(parts[0]) == 40:  # 40-char SHA-1 hash header
+            if len(parts[0]) == 40:
                 current_hash = parts[0]
                 if current_hash not in commits:
                     commits[current_hash] = {
@@ -70,9 +67,10 @@ class GitIntelligence:
 
         return list(commits.values())
 
-    def get_commit_details(self, commit_hash: str) -> Dict[str, Any]:
+    def get_commit_details(self, commit_hash: str, relative_file_path: str) -> Dict[str, Any]:
         """
-        Fetches the complete commit message, author, date, and diff patch.
+        Fetches metadata and SCOPED diff patch for a single target file,
+        preventing multi-file noise in LLM context.
         """
         metadata = self._run_git([
             "show",
@@ -82,11 +80,14 @@ class GitIntelligence:
             commit_hash
         ])
 
+        # Target diff strictly to the specific file
         diff_patch = self._run_git([
             "show",
             "--patch",
             "--color=never",
-            commit_hash
+            commit_hash,
+            "--",
+            relative_file_path
         ])
 
         parts = metadata.split("|") if "|" in metadata else [commit_hash, "Unknown", "Unknown", "No message"]
@@ -96,47 +97,81 @@ class GitIntelligence:
             "author": parts[1] if len(parts) > 1 else "Unknown",
             "date": parts[2] if len(parts) > 2 else "Unknown",
             "subject": parts[3] if len(parts) > 3 else "Unknown",
-            "diff": diff_patch
+            "file_diff": diff_patch
         }
+
+    def get_method_history(self, relative_file_path: str, start_line: int, end_line: int, max_commits: int = 5) -> List[Dict[str, Any]]:
+        """
+        Tracks line-range historical evolution over time via git log -L.
+        """
+        raw_log = self._run_git([
+            "log",
+            f"-L{start_line},{end_line}:{relative_file_path}",
+            f"-n{max_commits}",
+            "--format=COMMIT_START|%H|%an|%ad|%s",
+            "--date=iso-strict",
+            "--no-patch"
+        ])
+
+        if raw_log.startswith("Git error"):
+            return []
+
+        history = []
+        for line in raw_log.split("\n"):
+            if line.startswith("COMMIT_START|"):
+                parts = line.split("|")
+                if len(parts) >= 5:
+                    history.append({
+                        "commit_hash": parts[1],
+                        "author": parts[2],
+                        "date": parts[3],
+                        "subject": parts[4]
+                    })
+        return history
 
     def get_method_provenance(self, relative_file_path: str, method_name: str, start_line: int, end_line: int) -> Dict[str, Any]:
         """
-        Main entrypoint: Maps AST method bounds to latest commit details and patch diff.
+        Main entrypoint: Returns fully structured JSON-ready provenance data including
+        dominant commit, file-scoped diff, blame breakdown, and historical evolution.
         """
         blame_records = self.get_method_blame(relative_file_path, start_line, end_line)
         if not blame_records:
             return {"error": f"No Git blame data found for {method_name} in {relative_file_path}"}
 
-        # Filter out zero-hash (uncommitted local working tree changes)
         committed_records = [
             r for r in blame_records 
             if not r["commit_hash"].startswith("00000000")
         ]
 
+        # Fetch chronological commit history for the method's line bounds
+        method_history = self.get_method_history(relative_file_path, start_line, end_line)
+
         if not committed_records:
             return {
                 "method_name": method_name,
                 "file_path": relative_file_path,
-                "lines": [start_line, end_line],
+                "line_range": [start_line, end_line],
                 "blame_summary": blame_records,
+                "evolution_history": [],
                 "primary_commit": {
                     "commit_hash": "uncommitted",
                     "author": "Local Working Tree",
                     "date": "Now",
                     "subject": "Uncommitted local edits",
-                    "diff": "Local uncommitted changes exist for this method."
+                    "file_diff": "Local uncommitted changes exist for this method."
                 }
             }
 
-        # Identify primary committed hash with max affected lines
+        # Dominant commit (highest line impact within method)
         primary_commit = max(committed_records, key=lambda x: x["lines_affected"])
-        commit_details = self.get_commit_details(primary_commit["commit_hash"])
+        commit_details = self.get_commit_details(primary_commit["commit_hash"], relative_file_path)
 
         return {
             "method_name": method_name,
             "file_path": relative_file_path,
-            "lines": [start_line, end_line],
+            "line_range": [start_line, end_line],
             "blame_summary": blame_records,
+            "evolution_history": method_history,
             "primary_commit": commit_details
         }
 
@@ -159,27 +194,11 @@ def main():
         end_line=args.end
     )
 
+    import json
     print("\n" + "="*80)
-    print(f" GIT PROVENANCE ANALYSIS: {provenance.get('method_name')}")
+    print(f" STRUCTURED GIT PROVENANCE DATA: {provenance.get('method_name')}")
     print("="*80)
-    print(f" File: {provenance.get('file_path')} (Lines {args.start}-{args.end})")
-    
-    primary = provenance.get("primary_commit", {})
-    print(f" Primary Commit Hash : {primary.get('commit_hash')}")
-    print(f" Author              : {primary.get('author')}")
-    print(f" Date                : {primary.get('date')}")
-    print(f" Commit Message      : {primary.get('subject')}")
-    
-    print("\n--- LINE BLAME DISTRIBUTION ---")
-    for record in provenance.get("blame_summary", []):
-        print(f" * Commit {record['commit_hash'][:8]} by {record['author']} -> Modifies {record['lines_affected']} lines")
-
-    print("\n--- COMMIT DIFF PATCH (Truncated 15 lines) ---")
-    diff_lines = primary.get("diff", "").split("\n")
-    for line in diff_lines[:15]:
-        print(f"   {line}")
-    if len(diff_lines) > 15:
-        print(f"   ... ({len(diff_lines) - 15} more lines)")
+    print(json.dumps(provenance, indent=2))
     print("="*80 + "\n")
 
 
