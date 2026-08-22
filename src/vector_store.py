@@ -46,6 +46,7 @@ class VectorStore:
         results = []
         for score, idx in zip(scores[0], indices[0]):
             if idx != -1 and idx < len(self.chunks):
-                results.append((float(score), self.chunks[idx]))
+                # FIXED: Return tuple is now (chunk, float(score)) matching main.py
+                results.append((self.chunks[idx], float(score)))
 
         return results
