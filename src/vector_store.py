@@ -1,42 +1,48 @@
 import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Tuple
+from sentence_transformers import SentenceTransformer
 
 class VectorStore:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         self.model = SentenceTransformer(model_name)
         self.index = None
-        self.chunks: List[Dict[str, Any]] = []
+        self.chunks = []
 
-    def build_index(self, chunks: List[Dict[str, Any]]) -> None:
-        """Generates embeddings from chunk representations and populates FAISS."""
+    def _get_text(self, chunk: Dict[str, Any]) -> str:
+        if "text_representation" in chunk and chunk["text_representation"]:
+            return chunk["text_representation"]
+        if "code_content" in chunk and chunk["code_content"]:
+            return chunk["code_content"]
+        return chunk.get("source_code", str(chunk))
+
+    def build_index(self, chunks: List[Dict[str, Any]]):
         self.chunks = chunks
-        texts = [c["text_representation"] for c in chunks]
+        if not chunks:
+            return
 
-        embeddings = self.model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+        texts = [self._get_text(c) for c in chunks]
+        embeddings = self.model.encode(texts, show_progress_bar=False)
         
-        # L2-normalize for Cosine Similarity matching via Inner Product index
+        # Normalize vectors for cosine similarity (IndexFlatIP)
         faiss.normalize_L2(embeddings)
         
         dimension = embeddings.shape[1]
         self.index = faiss.IndexFlatIP(dimension)
-        self.index.add(embeddings.astype(np.float32))
+        self.index.add(np.array(embeddings).astype("float32"))
         print(f"[VectorStore] Indexed {len(chunks)} chunks with dimension {dimension}.")
 
-    def search(self, query: str, top_k: int = 5) -> List[Tuple[Dict[str, Any], float]]:
-        """Returns the top_k relevant chunks and similarity scores for a natural language query."""
-        if self.index is None or not self.chunks:
-            raise ValueError("Index is not initialized. Run build_index() first.")
+    def search(self, query: str, top_k: int = 3) -> List[Tuple[Dict[str, Any], float]]:
+        if not self.index or len(self.chunks) == 0:
+            return []
 
-        query_vec = self.model.encode([query], convert_to_numpy=True)
-        faiss.normalize_L2(query_vec)
-
-        scores, indices = self.index.search(query_vec.astype(np.float32), top_k)
+        query_vector = self.model.encode([query])
+        faiss.normalize_L2(query_vector)
+        
+        distances, indices = self.index.search(np.array(query_vector).astype("float32"), top_k)
         
         results = []
-        for idx, score in zip(indices[0], scores[0]):
+        for idx, score in zip(indices[0], distances[0]):
             if idx != -1 and idx < len(self.chunks):
                 results.append((self.chunks[idx], float(score)))
-
         return results

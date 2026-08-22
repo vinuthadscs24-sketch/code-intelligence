@@ -1,50 +1,50 @@
 import javalang
-from typing import Dict, Any, Optional
 
 class JavaASTParser:
-    def parse_file(self, file_path: str) -> Optional[Dict[str, Any]]:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                code = f.read()
-            
-            tree = javalang.parse.parse(code)
-            return {"file_path": file_path, "tree": tree, "source_code": code}
-        except Exception as e:
-            print(f"Error parsing {file_path}: {e}")
-            return None
+    def parse_file(self, file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            source_code = f.read()
+        tree = javalang.parse.parse(source_code)
+        return tree, source_code
 
-    def extract_symbols_and_relations(self, tree, source_code: str):
-        methods_data = []
+    def extract_symbols_and_relations(self, tree, source_code):
+        methods = []
+        classes = []
 
-        for path, node in tree.filter(javalang.tree.ClassDeclaration):
-            class_name = node.name
-            implements_list = [impl.name for impl in node.implements] if node.implements else []
+        if tree is None:
+            return {"methods": methods, "classes": classes}
 
-            for method in node.methods:
-                method_name = method.name
-                param_types = [p.type.name for p in method.parameters] if method.parameters else []
-                param_str = ",".join(param_types)
-                signature = f"{method_name}({param_str})"
+        # Extract Class Declarations
+        for _, class_decl in tree.filter(javalang.tree.ClassDeclaration):
+            classes.append(class_decl.name)
 
-                calls = set()
-                instantiates = set()
+        # Extract Method Declarations
+        for _, method in tree.filter(javalang.tree.MethodDeclaration):
+            calls = []
+            instantiations = []
 
-                if method.body:
-                    for _, sub_node in method.filter(javalang.tree.MethodInvocation):
-                        calls.add(sub_node.member)
-                    for _, sub_node in method.filter(javalang.tree.ClassInstanceCreation):
-                        if hasattr(sub_node.type, "name"):
-                            instantiates.add(sub_node.type.name)
+            # Method Invocations
+            for _, call in method.filter(javalang.tree.MethodInvocation):
+                if call.member:
+                    calls.append(call.member)
 
-                methods_data.append({
-                    "class_name": class_name,
-                    "method_name": method_name,
-                    "signature": signature,
-                    "implements": implements_list,
-                    "relationships": {
-                        "CALLS": sorted(list(calls)),
-                        "INSTANTIATES": sorted(list(instantiates))
-                    }
-                })
+            # Object Instantiations -> Use ClassCreator
+            for _, creator in method.filter(javalang.tree.ClassCreator):
+                if hasattr(creator, "type") and hasattr(creator.type, "name"):
+                    instantiations.append(creator.type.name)
 
-        return methods_data
+            annotations = [ann.name for ann in getattr(method, "annotations", [])]
+
+            methods.append({
+                "name": method.name,
+                "enclosing_class": getattr(method, "_enclosing_class", "Global"),
+                "annotations": annotations,
+                "calls": calls,
+                "instantiations": instantiations,
+                "source_code": source_code  # Fallback to full source if range slice is omitted
+            })
+
+        return {
+            "classes": classes,
+            "methods": methods
+        }
