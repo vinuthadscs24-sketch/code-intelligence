@@ -2,6 +2,13 @@ from typing import List, Dict, Any
 from src.vector_store import VectorStore
 from src.graph_builder import CodeKnowledgeGraph
 
+# Key annotations indicating HTTP controllers and API endpoints
+WEB_ANNOTATIONS = {
+    "RestController", "Controller", "RequestMapping", 
+    "GetMapping", "PostMapping", "PutMapping", 
+    "DeleteMapping", "PatchMapping", "WebServlet"
+}
+
 class HybridRetriever:
     def __init__(self, vector_store: VectorStore, knowledge_graph: CodeKnowledgeGraph, rrf_k: int = 60, max_per_file: int = 1):
         self.vector_store = vector_store
@@ -28,6 +35,10 @@ class HybridRetriever:
         if not vector_chunks:
             return []
 
+        # Detect endpoint/controller intent in query
+        query_lower = query.lower()
+        is_endpoint_query = any(k in query_lower for k in ["controller", "endpoint", "api", "route", "http", "rest", "web"])
+
         # 2. Graph Context Expansion
         graph_results = []
         for chunk in vector_chunks:
@@ -48,19 +59,42 @@ class HybridRetriever:
                 except Exception:
                     pass
 
-        # 3. Reciprocal Rank Fusion (RRF)
+        # 3. Reciprocal Rank Fusion (RRF) with Annotation Reranking
         rrf_scores = {}
         
+        # Helper to apply standard RRF + annotation boost
+        def apply_rrf_score(chunk, rank):
+            chunk_id = chunk.get("chunk_id") or chunk.get("id") or str(rank)
+            base_score = 1.0 / (self.rrf_k + rank)
+            
+            # Apply 2.5x score boost if query targets web endpoints and chunk has controller annotations
+            if is_endpoint_query:
+                raw_annotations = chunk.get("annotations", [])
+                cleaned_annotations = {a.replace("@", "").strip() for a in raw_annotations}
+                if cleaned_annotations.intersection(WEB_ANNOTATIONS):
+                    base_score *= 2.5
+
+            rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + base_score
+
         # Score Vector Results
         for rank, chunk in enumerate(vector_chunks, start=1):
-            chunk_id = chunk.get("chunk_id") or chunk.get("id") or str(rank)
-            rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + (1.0 / (self.rrf_k + rank))
+            apply_rrf_score(chunk, rank)
             
         # Score Graph Connectivity
         for rank, g_res in enumerate(graph_results, start=1):
             chunk_id = g_res["chunk_id"]
-            rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + (1.0 / (self.rrf_k + rank))
+            # Lookup underlying chunk object to verify annotations
+            matching_chunk = next((c for c in vector_chunks if (c.get("chunk_id") or c.get("id")) == chunk_id), None)
             
+            base_score = 1.0 / (self.rrf_k + rank)
+            if is_endpoint_query and matching_chunk:
+                raw_annotations = matching_chunk.get("annotations", [])
+                cleaned_annotations = {a.replace("@", "").strip() for a in raw_annotations}
+                if cleaned_annotations.intersection(WEB_ANNOTATIONS):
+                    base_score *= 2.5
+                    
+            rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + base_score
+
         # Sort chunks by fused RRF score
         sorted_chunks = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
         

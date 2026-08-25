@@ -187,3 +187,14 @@ debug_parser.py
 test_parser_audit.py
 *.index
 
+
+__pycache__/
+*.pyc
+
+
+__pycache__/
+*.pyc
+
+
+cache/
+

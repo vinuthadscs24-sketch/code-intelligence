@@ -50,6 +50,7 @@ def main():
     cli_parser.add_argument("--method", type=str, help="Method name for --mode why-changed")
     cli_parser.add_argument("--start", type=int, help="Start line number for --mode why-changed")
     cli_parser.add_argument("--end", type=int, help="End line number for --mode why-changed")
+    cli_parser.add_argument("--rebuild-index", action="store_true", help="Force rebuild of FAISS index")
 
     args = cli_parser.parse_args()
 
@@ -110,9 +111,16 @@ def main():
         summary = kg.get_summary()
         print(f"Graph Built: {summary['total_nodes']} nodes, {summary['total_edges']} edges.")
 
-        print("\n[4/5] Building FAISS Vector Index...")
+        print("\n[4/5] Initializing FAISS Vector Index...")
         store = VectorStore()
-        store.build_index(chunks)
+        
+        # Load cached index or generate embeddings if cache missing or --rebuild-index flag passed
+        if args.rebuild_index or not store.load_index():
+            print("Building new vector index...")
+            store.build_index(chunks)
+            store.save_index()
+        else:
+            print("FAISS vector index ready.")
 
         print("\n[5/5] Initializing Intelligence Engine...")
         engine = CodeIntelligenceEngine(
