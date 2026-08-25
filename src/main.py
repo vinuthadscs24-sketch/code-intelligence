@@ -9,6 +9,8 @@ from src.parser import JavaASTParser
 from src.chunker import CodeChunker
 from src.vector_store import VectorStore
 from src.graph_builder import CodeKnowledgeGraph
+from src.llm_engine import CodeIntelligenceEngine
+
 
 def clone_repo_if_url(repo_input: str) -> tuple[Path, bool]:
     """
@@ -29,6 +31,7 @@ def clone_repo_if_url(repo_input: str) -> tuple[Path, bool]:
     else:
         return Path(repo_input), False
 
+
 def main():
     cli_parser = argparse.ArgumentParser(description="Codebase Vector & Knowledge Graph Search Engine")
     cli_parser.add_argument(
@@ -37,6 +40,17 @@ def main():
         default=None, 
         help="Path or GitHub repository URL to analyze"
     )
+    cli_parser.add_argument(
+        "--mode",
+        choices=["interactive", "why-changed"],
+        default="interactive",
+        help="Mode to run: 'interactive' search or 'why-changed' method provenance query"
+    )
+    cli_parser.add_argument("--file", type=str, help="Relative file path for --mode why-changed")
+    cli_parser.add_argument("--method", type=str, help="Method name for --mode why-changed")
+    cli_parser.add_argument("--start", type=int, help="Start line number for --mode why-changed")
+    cli_parser.add_argument("--end", type=int, help="End line number for --mode why-changed")
+
     args = cli_parser.parse_args()
 
     if not args.repo_path:
@@ -52,12 +66,12 @@ def main():
             print(f"Error: Directory '{repo_path}' does not exist.")
             sys.exit(1)
 
-        print(f"\n[1/4] Parsing repository at '{repo_path}'...")
+        print(f"\n[1/5] Parsing repository at '{repo_path}'...")
         parser = JavaASTParser()
         extracted_data = []
 
         for java_file in repo_path.rglob("*.java"):
-            # Skip non-class Java metadata files directly
+            # Skip non-class Java metadata files
             if java_file.name == "module-info.java" or "package-info.java" in java_file.name:
                 continue
 
@@ -69,9 +83,14 @@ def main():
                     elif isinstance(result, (tuple, list)):
                         tree = result[0]
                         source_code = result[1] if len(result) > 1 else ""
-                        extracted_data.append((Path(java_file), {"tree": tree, "source_code": source_code}))
+                        symbols = parser.extract_symbols_and_relations(tree, source_code)
+                        extracted_data.append((Path(java_file), {
+                            "tree": tree, 
+                            "source_code": source_code,
+                            "symbols": symbols
+                        }))
             except Exception:
-                # Silently skip parsing errors on complex/modern syntax
+                # Silently skip parsing errors on non-standard/complex syntax
                 pass
 
         if not extracted_data:
@@ -80,53 +99,78 @@ def main():
 
         print(f"Parsed {len(extracted_data)} Java file(s).")
 
-        print("\n[2/4] Generating AST chunks...")
+        print("\n[2/5] Generating AST chunks...")
         chunker = CodeChunker(parser=parser)
         chunks = chunker.create_chunks(extracted_data)
         print(f"Total Chunks Created: {len(chunks)}")
 
-        print("\n[3/4] Building Code Knowledge Graph...")
+        print("\n[3/5] Building Code Knowledge Graph...")
         kg = CodeKnowledgeGraph()
         kg.build_graph_from_chunks(chunks)
         summary = kg.get_summary()
         print(f"Graph Built: {summary['total_nodes']} nodes, {summary['total_edges']} edges.")
 
-        print("\n[4/4] Building FAISS Vector Index...")
+        print("\n[4/5] Building FAISS Vector Index...")
         store = VectorStore()
         store.build_index(chunks)
 
+        print("\n[5/5] Initializing Intelligence Engine...")
+        engine = CodeIntelligenceEngine(
+            repo_path=str(repo_path),
+            vector_store=store,
+            graph_db=kg
+        )
+
+        # Mode 1: Provenance check via CLI parameters
+        if args.mode == "why-changed":
+            if not all([args.file, args.method, args.start, args.end]):
+                print("Error: --mode why-changed requires --file, --method, --start, and --end parameters.")
+                sys.exit(1)
+            
+            res = engine.explain_why_changed(args.file, args.method, args.start, args.end)
+            print("\n" + "="*80)
+            print(f" PROVENANCE ANALYSIS: {args.method}() in {args.file}")
+            print("="*80)
+            print(res["answer"])
+            print("="*80)
+            return
+
+        # Mode 2: Interactive CLI Search Loop
         print("\n==================================================")
-        print("      FAISS Vector & Graph Search Engine Ready    ")
+        print("     FAISS Vector, Graph & LLM Engine Ready       ")
         print("==================================================")
         
         while True:
             try:
-                query = input("\nEnter search query (or 'exit' to quit): ").strip()
+                query = input("\nEnter code query or question (or 'exit' to quit): ").strip()
                 if not query or query.lower() == 'exit':
                     break
 
-                results = store.search(query, top_k=3)
-                print(f"\nTop matches for '{query}':")
-                
-                for rank, (chunk, score) in enumerate(results, start=1):
+                # Query Hybrid Retriever & Synthesize via LLM
+                response = engine.answer_query(query, top_k=5)
+                retrieved_chunks = response.get("retrieved_chunks", [])
+
+                print(f"\n--- Top Hybrid Matches ({len(retrieved_chunks)}) ---")
+                for rank, chunk in enumerate(retrieved_chunks, start=1):
                     chunk_id = chunk.get("chunk_id", "Unknown ID")
                     chunk_type = chunk.get("chunk_type", "METHOD")
                     file_name = Path(chunk.get("file_name", "unknown")).name
-                    annotations = chunk.get("annotations", [])
-                    code_snippet = chunk.get("code_content", "")[:200]
                     method_name = chunk.get("method_name", "")
+                    callers = chunk.get("graph_callers", [])
+                    callees = chunk.get("graph_callees", [])
+                    code_snippet = chunk.get("code_content", chunk.get("text_representation", ""))[:200]
 
-                    print(f"\n[{rank}] Score: {score:.4f} | ID: {chunk_id}")
-                    print(f"    Type: {chunk_type} | File: {file_name}")
-                    print(f"    Annotations: {annotations}")
-                    
-                    if method_name:
-                        calls = kg.get_calls_from(method_name)
-                        if calls:
-                            print(f"    Outgoing Calls (Graph): {calls}")
-                            
-                    print(f"    Code Snippet:\n{code_snippet}...\n")
-                    
+                    print(f"\n[{rank}] ID: {chunk_id} | Type: {chunk_type}")
+                    print(f"    File: {file_name} | Method: {method_name}")
+                    if callers:
+                        print(f"    Callers (Graph): {', '.join(callers)}")
+                    if callees:
+                        print(f"    Callees (Graph): {', '.join(callees)}")
+                    print(f"    Snippet:\n{code_snippet}...\n")
+                
+                print("--- LLM Contextual Answer ---")
+                print(response.get("answer", "No response generated."))
+
             except KeyboardInterrupt:
                 break
 

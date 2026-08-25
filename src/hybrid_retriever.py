@@ -3,14 +3,16 @@ from src.vector_store import VectorStore
 from src.graph_builder import CodeKnowledgeGraph
 
 class HybridRetriever:
-    def __init__(self, vector_store: VectorStore, knowledge_graph: CodeKnowledgeGraph, rrf_k: int = 60):
+    def __init__(self, vector_store: VectorStore, knowledge_graph: CodeKnowledgeGraph, rrf_k: int = 60, max_per_file: int = 1):
         self.vector_store = vector_store
         self.kg = knowledge_graph
         self.rrf_k = rrf_k
+        self.max_per_file = max_per_file
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        # 1. Semantic Vector Search
-        raw_vector_results = self.vector_store.search(query, top_k=top_k * 2)
+        # 1. Semantic Vector Search (fetch extra candidates for deduplication headroom)
+        fetch_limit = top_k * 4
+        raw_vector_results = self.vector_store.search(query, top_k=fetch_limit)
         
         # Standardize vector results (handles tuple vs dictionary returns)
         vector_chunks = []
@@ -62,16 +64,32 @@ class HybridRetriever:
         # Sort chunks by fused RRF score
         sorted_chunks = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
         
-        # Reconstruct final enriched payload
-        final_results = []
+        # 4. Reconstruct & Apply File-Level Deduplication
         chunk_map = {
             (c.get("chunk_id") or c.get("id") or str(idx + 1)): c 
             for idx, c in enumerate(vector_chunks)
         }
         
-        for chunk_id, score in sorted_chunks[:top_k]:
+        final_results = []
+        file_counts = {}
+
+        for chunk_id, score in sorted_chunks:
+            if len(final_results) >= top_k:
+                break
+
             if chunk_id in chunk_map:
-                enriched_chunk = chunk_map[chunk_id].copy()
+                chunk = chunk_map[chunk_id]
+                
+                # Extract file path/name key
+                file_key = chunk.get("file_name") or chunk.get("file_path") or chunk.get("source") or "unknown"
+                
+                # Skip if file instance limit reached
+                if file_counts.get(file_key, 0) >= self.max_per_file:
+                    continue
+
+                file_counts[file_key] = file_counts.get(file_key, 0) + 1
+
+                enriched_chunk = chunk.copy()
                 enriched_chunk["rrf_score"] = score
                 
                 # Attach graph context if present
