@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from src.repo_utils import clone_repo_if_url
 from src.parser import JavaASTParser
 from src.chunker import CodeChunker
 from src.vector_store import VectorStore
@@ -20,14 +21,29 @@ def clone_repo_if_url(repo_input: str) -> tuple[Path, bool]:
     If yes, clones it into a temporary directory and returns (temp_path, True).
     If no, treats it as a local path and returns (Path(repo_input), False).
     """
-    if repo_input.startswith("http://") or repo_input.startswith("https://") or repo_input.endswith(".git"):
+    is_url = (
+        repo_input.startswith("http://") 
+        or repo_input.startswith("https://") 
+        or repo_input.startswith("git@") 
+        or repo_input.endswith(".git")
+    )
+    if is_url:
         temp_dir = tempfile.mkdtemp(prefix="repo_clone_")
         print(f"\n[Git] Cloning repository from '{repo_input}' into temporary directory...")
         try:
-            subprocess.run(["git", "clone", "--depth", "1", repo_input, temp_dir], check=True)
+            subprocess.run(
+                ["git", "clone", "--depth", "1", repo_input, temp_dir],
+                check=True,
+                capture_output=True,
+                text=True
+            )
             return Path(temp_dir), True
+        except subprocess.CalledProcessError as e:
+            print(f"[Error] Failed to clone repository:\n{e.stderr}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            sys.exit(1)
         except Exception as e:
-            print(f"Error cloning repository: {e}")
+            print(f"[Error] Unexpected error cloning repository: {e}")
             shutil.rmtree(temp_dir, ignore_errors=True)
             sys.exit(1)
     else:
@@ -35,7 +51,9 @@ def clone_repo_if_url(repo_input: str) -> tuple[Path, bool]:
 
 
 def main():
-    cli_parser = argparse.ArgumentParser(description="Codebase Vector & Knowledge Graph Search Engine")
+    cli_parser = argparse.ArgumentParser(
+        description="Codebase Vector & Knowledge Graph Search Engine"
+    )
     cli_parser.add_argument(
         "repo_path", 
         nargs="?", 
@@ -74,8 +92,8 @@ def main():
         extracted_data = []
 
         for java_file in repo_path.rglob("*.java"):
-            # Skip non-class Java metadata files
-            if java_file.name == "module-info.java" or "package-info.java" in java_file.name:
+            # Skip module and package metadata descriptors
+            if java_file.name in {"module-info.java", "package-info.java"}:
                 continue
 
             try:
@@ -93,7 +111,7 @@ def main():
                             "symbols": symbols
                         }))
             except Exception:
-                # Silently skip parsing errors on non-standard/complex syntax
+                # Silently skip parsing errors on complex/non-standard syntax
                 pass
 
         if not extracted_data:
@@ -116,7 +134,7 @@ def main():
         print("\n[4/5] Initializing FAISS Vector Index...")
         store = VectorStore()
         
-        # Load cached index or generate embeddings if cache missing or --rebuild-index flag passed
+        # Load cached index or generate embeddings if missing or requested
         if args.rebuild_index or not store.load_index():
             print("Building new vector index...")
             store.build_index(chunks)

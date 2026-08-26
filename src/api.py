@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
-from src.main import clone_repo_if_url
+from src.repo_utils import clone_repo_if_url
 from src.parser import JavaASTParser
 from src.chunker import CodeChunker
 from src.vector_store import VectorStore
