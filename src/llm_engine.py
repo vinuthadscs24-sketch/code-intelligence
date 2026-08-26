@@ -1,14 +1,19 @@
 import os
 import json
-from typing import Dict, Any, Optional
+import logging
+from typing import Dict, Any, Optional, List
+
 from src.git_intelligence import GitIntelligence
 from src.hybrid_retriever import HybridRetriever
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("CodeIntelligenceEngine")
 
 
 class CodeIntelligenceEngine:
     """
-    Phase 8: Synthesizes structural graph context, semantic vector search, 
-    and Git provenance into evidence-backed LLM prompt answers.
+    Synthesizes structural graph context, semantic vector search, 
+    and Git provenance into evidence-backed LLM responses.
     """
     def __init__(
         self, 
@@ -24,6 +29,7 @@ class CodeIntelligenceEngine:
         self.git_intel = GitIntelligence(self.repo_path)
         self.model_name = model_name
         self.provider = provider.lower()
+        
         if self.vector_store and self.graph_db:
             self.retriever = HybridRetriever(self.vector_store, self.graph_db)
         else:
@@ -31,7 +37,7 @@ class CodeIntelligenceEngine:
 
     def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
         """
-        Invokes the configured LLM client (OpenAI, Anthropic, or Ollama) with standard fallbacks.
+        Invokes configured LLM client (OpenAI, Anthropic, Gemini, or Ollama) with standard fallbacks.
         """
         sys_msg = system_prompt or "You are a specialized Codebase Intelligence AI."
 
@@ -40,8 +46,9 @@ class CodeIntelligenceEngine:
             try:
                 import openai
                 client = openai.OpenAI()
+                target_model = self.model_name if "gpt" in self.model_name.lower() else "gpt-4o-mini"
                 response = client.chat.completions.create(
-                    model=self.model_name if "gpt" in self.model_name else "gpt-4o-mini",
+                    model=target_model,
                     messages=[
                         {"role": "system", "content": sys_msg},
                         {"role": "user", "content": prompt}
@@ -50,6 +57,7 @@ class CodeIntelligenceEngine:
                 )
                 return response.choices[0].message.content.strip()
             except Exception as e:
+                logger.warning(f"OpenAI Execution Failed: {e}")
                 if self.provider == "openai":
                     return f"Error executing OpenAI call: {str(e)}"
 
@@ -58,19 +66,36 @@ class CodeIntelligenceEngine:
             try:
                 import anthropic
                 client = anthropic.Anthropic()
+                target_model = self.model_name if "claude" in self.model_name.lower() else "claude-3-5-sonnet-20241022"
                 response = client.messages.create(
-                    model="claude-3-5-sonnet-20241022",
+                    model=target_model,
                     max_tokens=1024,
                     system=sys_msg,
                     messages=[{"role": "user", "content": prompt}]
                 )
                 return response.content[0].text.strip()
             except Exception as e:
+                logger.warning(f"Anthropic Execution Failed: {e}")
                 if self.provider == "anthropic":
                     return f"Error executing Anthropic call: {str(e)}"
 
-        # 3. Fallback to Local Ollama Call
-        ollama_models = [self.model_name, "qwen2.5-coder:latest", "qwen2.5-coder", "llama3"]
+        # 3. Attempt Gemini Call
+        if (self.provider in ["auto", "gemini"]) and (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+            try:
+                import google.generativeai as genai
+                api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+                genai.configure(api_key=api_key)
+                target_model = self.model_name if "gemini" in self.model_name.lower() else "gemini-1.5-pro"
+                model = genai.GenerativeModel(target_model)
+                response = model.generate_content(f"{sys_msg}\n\n{prompt}")
+                return response.text.strip()
+            except Exception as e:
+                logger.warning(f"Gemini Execution Failed: {e}")
+                if self.provider == "gemini":
+                    return f"Error executing Gemini call: {str(e)}"
+
+        # 4. Fallback to Local Ollama Call
+        ollama_models = list(dict.fromkeys([self.model_name, "qwen2.5-coder:latest", "qwen2.5-coder", "llama3"]))
         for target_model in ollama_models:
             try:
                 import urllib.request
@@ -91,12 +116,12 @@ class CodeIntelligenceEngine:
             except Exception:
                 continue
 
-        return "[LLM Execution Skipped]: No API keys detected (OPENAI_API_KEY / ANTHROPIC_API_KEY) and local Ollama is offline. Prompt was built successfully."
+        return "[LLM Execution Skipped]: No API keys detected and local Ollama server is offline."
 
     def explain_why_changed(self, relative_file_path: str, method_name: str, start_line: int, end_line: int) -> Dict[str, Any]:
         """
         Gathers Git provenance + AST method code + caller/callee context 
-        and formats an LLM query answering: 'Why was this method changed?'
+        and invokes an LLM to answer: 'Why was this method changed?'
         """
         provenance = self.git_intel.get_method_provenance(
             relative_file_path=relative_file_path,
@@ -107,8 +132,21 @@ class CodeIntelligenceEngine:
 
         primary_commit = provenance.get("primary_commit", {})
 
-        callers = self.graph_db.find_callers(method_name) if self.graph_db and hasattr(self.graph_db, "find_callers") else []
-        callees = self.graph_db.find_callees(method_name) if self.graph_db and hasattr(self.graph_db, "find_callees") else []
+        callers: List[str] = []
+        callees: List[str] = []
+        if self.graph_db:
+            if hasattr(self.graph_db, "find_callers"):
+                callers = self.graph_db.find_callers(method_name)
+            elif hasattr(self.graph_db, "get_callers_of"):
+                callers = self.graph_db.get_callers_of(method_name)
+
+            if hasattr(self.graph_db, "find_callees"):
+                callees = self.graph_db.find_callees(method_name)
+            elif hasattr(self.graph_db, "get_calls_from"):
+                callees = self.graph_db.get_calls_from(method_name)
+
+        diff_raw = primary_commit.get("diff") or ""
+        truncated_diff = diff_raw[:1200] + ("\n...[diff truncated]" if len(diff_raw) > 1200 else "")
 
         context_payload = {
             "symbol": method_name,
@@ -123,7 +161,7 @@ class CodeIntelligenceEngine:
                 "author": primary_commit.get("author"),
                 "date": primary_commit.get("date"),
                 "commit_message": primary_commit.get("subject"),
-                "patch_diff": (primary_commit.get("diff") or "")[:1000]
+                "patch_diff": truncated_diff
             }
         }
 
@@ -135,7 +173,7 @@ Analyze the provided code method, its Git history, commit messages, and patch di
 
 === INSTRUCTIONS ===
 1. State the exact primary reason for the change based on the commit message and patch diff.
-2. Cite the Commit Hash ({primary_commit.get('commit_hash')}) and Author ({primary_commit.get('author')}).
+2. Cite the Commit Hash ({primary_commit.get('commit_hash', 'N/A')}) and Author ({primary_commit.get('author', 'N/A')}).
 3. Explain the technical modifications made inside the line range [{start_line}-{end_line}].
 
 Explanation:"""
@@ -152,7 +190,6 @@ Explanation:"""
     def answer_query(self, query: str, top_k: int = 10) -> Dict[str, Any]:
         """
         Answers general natural language questions using hybrid retrieval (Vector + Graph).
-        Defaults to top_k=10 for deeper contextual coverage.
         """
         retrieved_chunks = []
         if self.retriever:
@@ -161,27 +198,26 @@ Explanation:"""
             raw_res = self.vector_store.search(query, top_k=top_k)
             retrieved_chunks = [r[0] if isinstance(r, tuple) else r for r in raw_res]
 
-        # Prioritize implementation chunks over simple SystemProperties if available
         impl_chunks = [c for c in retrieved_chunks if "SystemProperties" not in c.get('file_name', '')]
         final_chunks = impl_chunks if impl_chunks else retrieved_chunks
 
-        # Build enriched context string containing graph metadata
         context_blocks = []
         for c in final_chunks[:top_k]:
             callers_str = f"Callers: {', '.join(c.get('graph_callers', []))}" if c.get('graph_callers') else ""
             callees_str = f"Callees: {', '.join(c.get('graph_callees', []))}" if c.get('graph_callees') else ""
-            graph_meta = f" | {callers_str} {callees_str}".strip()
+            graph_meta = f" | {callers_str} {callees_str}".strip(" |")
 
             block = (
                 f"File: {c.get('file_name', 'Unknown')}\n"
-                f"Class: {c.get('class_name', '')} | Method: {c.get('method_name', '')} {graph_meta}\n"
+                f"Class: {c.get('class_name', '')} | Method: {c.get('method_name', '')}"
+                f"{' | ' + graph_meta if graph_meta else ''}\n"
                 f"Code:\n{c.get('code_content', c.get('text_representation', ''))}"
             )
             context_blocks.append(block)
 
         context_str = "\n---\n".join(context_blocks) if context_blocks else "No relevant code chunks retrieved."
 
-        prompt = f"""You are an expert AI software architect analyzing a Java repository.
+        prompt = f"""You are an expert AI software architect analyzing a repository.
 Answer the user query based strictly on the provided codebase context and structural graph relationships.
 
 === USER QUERY ===
@@ -207,7 +243,7 @@ Answer the user query based strictly on the provided codebase context and struct
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Phase 8 Context Builder & LLM Engine")
+    parser = argparse.ArgumentParser(description="Context Builder & LLM Engine")
     parser.add_argument("--repo", type=str, default="./")
     parser.add_argument("--file", type=str, required=True)
     parser.add_argument("--method", type=str, required=True)
@@ -219,7 +255,7 @@ if __name__ == "__main__":
     result = engine.explain_why_changed(args.file, args.method, args.start, args.end)
 
     print("\n" + "="*80)
-    print(f" PHASE 8 PROMPT: Why was {args.method}() changed?")
+    print(f" PROMPT: Why was {args.method}() changed?")
     print("="*80)
     print(result["prompt"])
     print("="*80)
