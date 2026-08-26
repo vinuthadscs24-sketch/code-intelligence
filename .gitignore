@@ -1,14 +1,21 @@
+# Virtual Environments & Cache
 .venv/
 venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Indexes & Local Workspace Repos
 data/repositories/
 data/indexes/
 *.faiss
 *.pkl
+
+# NLTK Data & Logs
 nltk_data/
 *.log
+
+# IDE & OS Files
 .vscode/
 .idea/
 .DS_Store
