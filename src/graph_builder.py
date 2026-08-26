@@ -1,4 +1,5 @@
 import json
+import re
 import networkx as nx
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Union
@@ -136,8 +137,76 @@ class CodeKnowledgeGraph:
                 self.graph.add_node(call_id, type="METHOD")
                 self.graph.add_edge(method_id, call_id, relation="CALLS")
 
+    def search_graph(self, query: str, top_k: int = 5, vector_store=None) -> List[Dict[str, Any]]:
+        """
+        Traverses the NetworkX knowledge graph starting from query symbols to locate relevant chunks.
+        Uses camelCase tokenization for fuzzy matching and vector store fallbacks for seed nodes.
+        """
+        raw_words = set(re.findall(r'[A-Za-z0-9]+', query))
+        query_tokens = {w.lower() for w in raw_words if len(w) > 2}
+
+        seed_nodes = set()
+
+        # 1. Broad symbol and sub-token matching across nodes
+        for node in self.graph.nodes():
+            node_str = str(node)
+            # Split camelCase node names into individual tokens (e.g., FastDateFormat -> fast, date, format)
+            split_words = set(re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\b)|[0-9]+', node_str))
+            node_tokens = {w.lower() for w in split_words if len(w) > 1}
+            
+            # Check for direct sub-token intersections or exact substring matches
+            if query_tokens.intersection(node_tokens) or any(qt in node_str.lower() for qt in query_tokens):
+                seed_nodes.add(node)
+
+        # 2. VectorStore fallback if graph exact matching misses seed nodes
+        if len(seed_nodes) < 3 and vector_store and hasattr(vector_store, "search"):
+            raw_vec = vector_store.search(query, top_k=5)
+            for item in raw_vec:
+                chunk = item[0] if isinstance(item, tuple) else item
+                cls = chunk.get("class_name")
+                mth = chunk.get("method_name")
+                if cls and self.graph.has_node(cls):
+                    seed_nodes.add(cls)
+                if cls and mth:
+                    m_id = f"{cls}.{mth}()"
+                    if self.graph.has_node(m_id):
+                        seed_nodes.add(m_id)
+
+        # 3. Graph traversal from seeds to 1-hop neighborhood
+        visited = set()
+        matched_chunks = []
+
+        for seed in seed_nodes:
+            if seed in visited:
+                continue
+            visited.add(seed)
+
+            node_attrs = self.graph.nodes[seed]
+            chunk_dict = {
+                "id": seed,
+                "class_name": seed if node_attrs.get("type") == "CLASS" else str(seed).split(".")[0],
+                "method_name": node_attrs.get("name", str(seed).split(".")[-1].replace("()", "")),
+                "file_name": node_attrs.get("file", ""),
+                "node_type": node_attrs.get("type", "UNKNOWN")
+            }
+            matched_chunks.append(chunk_dict)
+
+            # Traversal across outgoing relationships (methods, implementations)
+            for neighbor in self.graph.successors(seed):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    n_attrs = self.graph.nodes[neighbor]
+                    matched_chunks.append({
+                        "id": neighbor,
+                        "class_name": neighbor if n_attrs.get("type") == "CLASS" else str(neighbor).split(".")[0],
+                        "method_name": n_attrs.get("name", str(neighbor).split(".")[-1].replace("()", "")),
+                        "file_name": n_attrs.get("file", ""),
+                        "node_type": n_attrs.get("type", "UNKNOWN")
+                    })
+
+        return matched_chunks[:top_k]
+
     def get_calls_from(self, method_name: str) -> List[str]:
-        """Returns outgoing method calls from a specified method node."""
         target = method_name if method_name.endswith("()") else f"{method_name}()"
         if not self.graph.has_node(target):
             target = method_name
@@ -149,7 +218,6 @@ class CodeKnowledgeGraph:
         ]
 
     def get_callers_of(self, method_name: str) -> List[str]:
-        """Returns incoming callers for a specified method node."""
         target = method_name if method_name.endswith("()") else f"{method_name}()"
         if not self.graph.has_node(target):
             target = method_name
@@ -187,8 +255,8 @@ class CodeKnowledgeGraph:
         out_file.parent.mkdir(parents=True, exist_ok=True)
         nx.write_graphml(self.graph, out_file)
         print(f"[Graph] Exported GraphML to: {out_file.resolve()}")
+
     def get_class_methods(self, class_name: str) -> List[str]:
-        """Returns all method names belonging to a specified class."""
         if not self.graph.has_node(class_name):
             return []
         return [
@@ -197,14 +265,12 @@ class CodeKnowledgeGraph:
         ]
 
     def get_class_containing(self, method_name: str) -> List[str]:
-        """Returns class names that contain the specified method."""
         results = []
         for src, dst, data in self.graph.edges(data=True):
             if data.get("relation") == "HAS_METHOD":
                 if method_name in dst:
                     results.append(src)
         return list(set(results))
-        
 
     def inspect_class_dependencies(self, class_name: str) -> dict:
         if class_name not in self.graph:

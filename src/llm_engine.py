@@ -5,6 +5,7 @@ from typing import Dict, Any, Optional, List
 
 from src.git_intelligence import GitIntelligence
 from src.hybrid_retriever import HybridRetriever
+from src.context_builder import CodeIntelligenceContextBuilder
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CodeIntelligenceEngine")
@@ -20,6 +21,7 @@ class CodeIntelligenceEngine:
         repo_path: str, 
         vector_store=None, 
         graph_db=None, 
+        context_builder: Optional[CodeIntelligenceContextBuilder] = None,
         model_name: str = "qwen2.5-coder:latest",
         provider: str = "auto"
     ):
@@ -27,6 +29,7 @@ class CodeIntelligenceEngine:
         self.vector_store = vector_store
         self.graph_db = graph_db
         self.git_intel = GitIntelligence(self.repo_path)
+        self.context_builder = context_builder or CodeIntelligenceContextBuilder(git_intel=self.git_intel)
         self.model_name = model_name
         self.provider = provider.lower()
         
@@ -37,7 +40,8 @@ class CodeIntelligenceEngine:
 
     def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
         """
-        Invokes configured LLM client (OpenAI, Anthropic, Gemini, or Ollama) with standard fallbacks.
+        Invokes configured LLM client (OpenAI, Anthropic, Gemini via google-genai SDK, or Ollama) 
+        with standard fallbacks.
         """
         sys_msg = system_prompt or "You are a specialized Codebase Intelligence AI."
 
@@ -79,15 +83,18 @@ class CodeIntelligenceEngine:
                 if self.provider == "anthropic":
                     return f"Error executing Anthropic call: {str(e)}"
 
-        # 3. Attempt Gemini Call
+        # 3. Attempt Gemini Call (Using official google-genai SDK)
         if (self.provider in ["auto", "gemini"]) and (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
             try:
-                import google.generativeai as genai
+                from google import genai
                 api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-                genai.configure(api_key=api_key)
-                target_model = self.model_name if "gemini" in self.model_name.lower() else "gemini-1.5-pro"
-                model = genai.GenerativeModel(target_model)
-                response = model.generate_content(f"{sys_msg}\n\n{prompt}")
+                client = genai.Client(api_key=api_key)
+                target_model = self.model_name if "gemini" in self.model_name.lower() else "gemini-2.5-flash"
+                
+                response = client.models.generate_content(
+                    model=target_model,
+                    contents=f"{sys_msg}\n\n{prompt}"
+                )
                 return response.text.strip()
             except Exception as e:
                 logger.warning(f"Gemini Execution Failed: {e}")
@@ -116,7 +123,7 @@ class CodeIntelligenceEngine:
             except Exception:
                 continue
 
-        return "[LLM Execution Skipped]: No API keys detected and local Ollama server is offline."
+        return "[LLM Execution Skipped]: No API keys detected (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY) and local Ollama server is offline."
 
     def explain_why_changed(self, relative_file_path: str, method_name: str, start_line: int, end_line: int) -> Dict[str, Any]:
         """
@@ -187,9 +194,10 @@ Explanation:"""
             "answer": answer
         }
 
-    def answer_query(self, query: str, top_k: int = 10) -> Dict[str, Any]:
+    def answer_query(self, query: str, top_k: int = 5) -> Dict[str, Any]:
         """
-        Answers general natural language questions using hybrid retrieval (Vector + Graph).
+        Answers general natural language questions using hybrid retrieval (Vector + Graph) 
+        and structured prompt formatting.
         """
         retrieved_chunks = []
         if self.retriever:
@@ -198,44 +206,13 @@ Explanation:"""
             raw_res = self.vector_store.search(query, top_k=top_k)
             retrieved_chunks = [r[0] if isinstance(r, tuple) else r for r in raw_res]
 
-        impl_chunks = [c for c in retrieved_chunks if "SystemProperties" not in c.get('file_name', '')]
-        final_chunks = impl_chunks if impl_chunks else retrieved_chunks
-
-        context_blocks = []
-        for c in final_chunks[:top_k]:
-            callers_str = f"Callers: {', '.join(c.get('graph_callers', []))}" if c.get('graph_callers') else ""
-            callees_str = f"Callees: {', '.join(c.get('graph_callees', []))}" if c.get('graph_callees') else ""
-            graph_meta = f" | {callers_str} {callees_str}".strip(" |")
-
-            block = (
-                f"File: {c.get('file_name', 'Unknown')}\n"
-                f"Class: {c.get('class_name', '')} | Method: {c.get('method_name', '')}"
-                f"{' | ' + graph_meta if graph_meta else ''}\n"
-                f"Code:\n{c.get('code_content', c.get('text_representation', ''))}"
-            )
-            context_blocks.append(block)
-
-        context_str = "\n---\n".join(context_blocks) if context_blocks else "No relevant code chunks retrieved."
-
-        prompt = f"""You are an expert AI software architect analyzing a repository.
-Answer the user query based strictly on the provided codebase context and structural graph relationships.
-
-=== USER QUERY ===
-{query}
-
-=== RETRIEVED HYBRID CONTEXT ===
-{context_str}
-
-=== INSTRUCTIONS ===
-- Provide a clear, technical answer explaining which files and methods are involved.
-- Reference specific method signatures, caller/callee relationships, and class names directly.
-- If context is insufficient, state what is known from the context.
-"""
-
+        # Use context builder to format prompt
+        prompt = self.context_builder.format_llm_prompt(query=query, retrieved_chunks=retrieved_chunks)
         answer = self._call_llm(prompt)
+
         return {
             "query": query,
-            "retrieved_chunks": final_chunks,
+            "retrieved_chunks": retrieved_chunks,
             "prompt": prompt,
             "answer": answer
         }

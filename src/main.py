@@ -9,6 +9,8 @@ from src.parser import JavaASTParser
 from src.chunker import CodeChunker
 from src.vector_store import VectorStore
 from src.graph_builder import CodeKnowledgeGraph
+from src.git_intelligence import GitIntelligence
+from src.context_builder import CodeIntelligenceContextBuilder
 from src.llm_engine import CodeIntelligenceEngine
 
 
@@ -122,11 +124,15 @@ def main():
         else:
             print("FAISS vector index ready.")
 
-        print("\n[5/5] Initializing Intelligence Engine...")
+        print("\n[5/5] Initializing Intelligence Engine & Context Builder...")
+        git_intel = GitIntelligence(repo_path=str(repo_path))
+        context_builder = CodeIntelligenceContextBuilder(git_intel=git_intel)
+        
         engine = CodeIntelligenceEngine(
             repo_path=str(repo_path),
             vector_store=store,
-            graph_db=kg
+            graph_db=kg,
+            context_builder=context_builder
         )
 
         # Mode 1: Provenance check via CLI parameters
@@ -139,7 +145,7 @@ def main():
             print("\n" + "="*80)
             print(f" PROVENANCE ANALYSIS: {args.method}() in {args.file}")
             print("="*80)
-            print(res["answer"])
+            print(res.get("answer", "No response generated."))
             print("="*80)
             return
 
