@@ -180,3 +180,5 @@ config.yaml
 .DS_Store
 
 src/data/
+
+data/

@@ -5,334 +5,1005 @@ from typing import List, Tuple, Optional, Dict, Any
 
 import faiss
 import numpy as np
+import requests
 from loguru import logger
 
 from src import config
-from src.data_processing.chunkers import DocumentChunk  # Pydantic model for chunks
+from src.data_processing.chunkers import DocumentChunk
 
 
-def _process_batch(batch_info: Tuple[int, List[str]], model_name: str, dimensions: int, apikey: Optional[str]) -> Tuple[int, Optional[List[List[float]]]]:
+# ============================================================
+# OLLAMA EMBEDDINGS
+# ============================================================
+
+def _process_batch(
+    batch_info: Tuple[int, List[str]],
+    model_name: str,
+    dimensions: int,
+    apikey: Optional[str] = None
+) -> Tuple[int, Optional[List[List[float]]]]:
     """
-    Process a single batch of texts and return embeddings with batch index for ordering.
+    Generate embeddings for one batch using Ollama.
     """
+
     batch_idx, batch_texts = batch_info
+
     try:
-        client = config.get_openai_embeddings_client(apikey=apikey)
-        response = client.embeddings.create(
-            input=batch_texts,
-            model=model_name,
-            encoding_format="float",
-            dimensions=dimensions
+        url = f"{config.OLLAMA_BASE_URL}/api/embed"
+
+        response = requests.post(
+            url,
+            json={
+                "model": model_name,
+                "input": batch_texts
+            },
+            timeout=120
         )
-        batch_embeddings = [item.embedding for item in response.data]
-        logger.debug(f"Generated embeddings for batch {batch_idx + 1}")
-        return batch_idx, batch_embeddings
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        embeddings = data.get("embeddings")
+
+        if not embeddings:
+            raise ValueError(
+                "Ollama returned no embeddings."
+            )
+
+        # Check embedding dimension
+        actual_dimension = len(embeddings[0])
+
+        if actual_dimension != dimensions:
+            raise ValueError(
+                f"Embedding dimension mismatch. "
+                f"Expected {dimensions}, "
+                f"got {actual_dimension}."
+            )
+
+        logger.debug(
+            f"Generated Ollama embeddings for batch "
+            f"{batch_idx + 1}"
+        )
+
+        return batch_idx, embeddings
+
     except Exception as e:
-        logger.error(f"Error generating OpenAI embeddings for batch {batch_idx + 1}: {e}")
+
+        logger.error(
+            f"Error generating Ollama embeddings "
+            f"for batch {batch_idx + 1}: {e}"
+        )
+
         return batch_idx, None
 
 
+# ============================================================
+# GENERATE EMBEDDINGS
+# ============================================================
+
 def generate_embeddings(
-        texts: List[str],
-        model_name: str = config.EMBEDDING_MODEL_NAME,
-        batch_size: int = config.EMBEDDING_BATCH_SIZE,
-        dimensions: int = config.EMBEDDING_DIMENSIONS,
-        apikey: Optional[str] = None,
-        max_workers: int = 10
+    texts: List[str],
+    model_name: str = config.EMBEDDING_MODEL_NAME,
+    batch_size: int = config.EMBEDDING_BATCH_SIZE,
+    dimensions: int = config.EMBEDDING_DIMENSIONS,
+    apikey: Optional[str] = None,
+    max_workers: int = 4
 ) -> Optional[np.ndarray]:
     """
-    Generates embeddings for a list of texts using the configured provider with parallel processing.
-
-    Args:
-        texts: List of texts to generate embeddings for
-        model_name: Name of the embedding model to use
-        batch_size: Size of each batch for API requests
-        dimensions: Dimension of the embeddings
-        apikey: API key for authentication
-        max_workers: Maximum number of threads for parallel processing
+    Generate embeddings using Ollama.
 
     Returns:
-        NumPy array of embeddings or None if failed
+        NumPy float32 array with shape:
+        (number_of_texts, embedding_dimension)
     """
+
     if not texts:
-        return np.array([])
+        return np.array([], dtype=np.float32)
 
-    logger.info(f"Generating embeddings for {len(texts)} texts using {model_name} (batch size: {batch_size}, threads: {max_workers}).")
+    logger.info(
+        f"Generating embeddings for {len(texts)} texts "
+        f"using Ollama model '{model_name}' "
+        f"(batch size: {batch_size})"
+    )
 
-    # Create batches with indices for maintaining order
+    # --------------------------------------------------------
+    # Create batches
+    # --------------------------------------------------------
+
     batches = []
+
     for i in range(0, len(texts), batch_size):
+
         batch_texts = texts[i:i + batch_size]
-        batches.append((i // batch_size, batch_texts))
 
-    # Process batches in parallel using ThreadPoolExecutor
-    all_embeddings = [None] * len(batches)  # Pre-allocate to maintain order
+        batches.append(
+            (
+                i // batch_size,
+                batch_texts
+            )
+        )
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all batch processing tasks
+    logger.info(
+        f"Created {len(batches)} embedding batches."
+    )
+
+    # --------------------------------------------------------
+    # Process batches in parallel
+    # --------------------------------------------------------
+
+    all_embeddings = [None] * len(batches)
+
+    with ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
+
         future_to_batch = {
-            executor.submit(_process_batch, batch_info, model_name, dimensions, apikey): batch_info[0]
+            executor.submit(
+                _process_batch,
+                batch_info,
+                model_name,
+                dimensions,
+                apikey
+            ): batch_info[0]
             for batch_info in batches
         }
 
-        # Collect results and maintain order
-        for future in as_completed(future_to_batch):
+        for future in as_completed(
+            future_to_batch
+        ):
+
             batch_idx = future_to_batch[future]
+
             try:
-                result_batch_idx, batch_embeddings = future.result()
-                if batch_embeddings is not None:
-                    all_embeddings[result_batch_idx] = batch_embeddings
-                else:
-                    logger.error(f"Failed to generate embeddings for batch {result_batch_idx + 1}")
+
+                result_batch_idx, batch_embeddings = (
+                    future.result()
+                )
+
+                if batch_embeddings is None:
+
+                    logger.error(
+                        f"Failed to generate embeddings "
+                        f"for batch {batch_idx + 1}"
+                    )
+
                     return None
+
+                all_embeddings[
+                    result_batch_idx
+                ] = batch_embeddings
+
             except Exception as e:
-                logger.error(f"Exception in batch processing: {e}")
+
+                logger.error(
+                    f"Exception in batch processing: {e}"
+                )
+
                 return None
 
-    # Flatten the results while maintaining order
+    # --------------------------------------------------------
+    # Flatten embeddings while preserving order
+    # --------------------------------------------------------
+
     embeddings_list = []
+
     for batch_embeddings in all_embeddings:
+
         if batch_embeddings is None:
-            logger.error("One or more batches failed to generate embeddings")
+
+            logger.error(
+                "One or more embedding batches failed."
+            )
+
             return None
-        embeddings_list.extend(batch_embeddings)
+
+        embeddings_list.extend(
+            batch_embeddings
+        )
 
     if not embeddings_list:
-        logger.warning("No embeddings were generated.")
-        return np.array([])
+
+        logger.warning(
+            "No embeddings were generated."
+        )
+
+        return np.array([], dtype=np.float32)
+
+    # --------------------------------------------------------
+    # Convert to NumPy
+    # --------------------------------------------------------
 
     try:
-        return np.array(embeddings_list).astype('float32')
-    except ValueError as ve:
-        logger.error(f"Could not convert embeddings to numpy array. Check for consistent embedding dimensions: {ve}")
-        # Log dimensions of first few embeddings if possible
-        if embeddings_list:
-            for i, emb in enumerate(embeddings_list[:3]):
-                logger.debug(f"Embedding {i} length: {len(emb) if isinstance(emb, list) else 'N/A'}")
+
+        embeddings_array = np.array(
+            embeddings_list,
+            dtype=np.float32
+        )
+
+        logger.info(
+            f"Embedding matrix shape: "
+            f"{embeddings_array.shape}"
+        )
+
+        return embeddings_array
+
+    except ValueError as e:
+
+        logger.error(
+            f"Could not convert embeddings "
+            f"to NumPy array: {e}"
+        )
+
         return None
 
+
+# ============================================================
+# FAISS VECTOR INDEX
+# ============================================================
 
 class FaissVectorIndex:
     """
     Manages the FAISS vector index and associated metadata.
     """
-    def __init__(self, index_dir: Path,
-                 embedding_dim: int = config.EMBEDDING_DIMENSIONS,
-                 model_name: str = config.EMBEDDING_MODEL_NAME,
-                 batch_size: int = config.EMBEDDING_BATCH_SIZE):
+
+    def __init__(
+        self,
+        index_dir: Path,
+        embedding_dim: int = config.EMBEDDING_DIMENSIONS,
+        model_name: str = config.EMBEDDING_MODEL_NAME,
+        batch_size: int = config.EMBEDDING_BATCH_SIZE
+    ):
+
         self.index_dir = index_dir
+
         self.embedding_dim = embedding_dim
-        self.index_file_path = self.index_dir / config.FAISS_INDEX_FILENAME
-        self.metadata_file_path = self.index_dir / config.METADATA_FILENAME
+
+        self.index_file_path = (
+            self.index_dir
+            / config.FAISS_INDEX_FILENAME
+        )
+
+        self.metadata_file_path = (
+            self.index_dir
+            / config.METADATA_FILENAME
+        )
+
         self.model = model_name
+
         self.batch_size = batch_size
 
         self.index: Optional[faiss.Index] = None
-        self.chunk_metadata: List[Dict[str, Any]] = [] # Stores metadata for each vector
 
-        self.index_dir.mkdir(parents=True, exist_ok=True)
+        self.chunk_metadata: List[
+            Dict[str, Any]
+        ] = []
 
-    def build_index(self, chunks: List[DocumentChunk], force_rebuild: bool = False, apikey: Optional[str] = None) -> bool:
-        """
-        Builds or rebuilds the FAISS index from a list of DocumentChunks.
-        """
-        if not force_rebuild and self.index_file_path.exists() and self.metadata_file_path.exists():
-            logger.info(f"Index already exists at {self.index_dir}. Skipping build. Use force_rebuild=True to override.")
-            # Optionally load existing index here if needed for immediate use,
-            # but typically build is called when creating, and load when using.
+        self.index_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+    # ========================================================
+    # BUILD INDEX
+    # ========================================================
+
+    def build_index(
+        self,
+        chunks: List[DocumentChunk],
+        force_rebuild: bool = False,
+        apikey: Optional[str] = None
+    ) -> bool:
+
+        if (
+            not force_rebuild
+            and self.index_file_path.exists()
+            and self.metadata_file_path.exists()
+        ):
+
+            logger.info(
+                f"Index already exists at "
+                f"{self.index_dir}."
+            )
+
             return True
 
         if not chunks:
-            logger.warning("No chunks provided to build the index.")
+
+            logger.warning(
+                "No chunks provided to build "
+                "the index."
+            )
+
             return False
 
-        logger.info(f"Building FAISS index with {len(chunks)} chunks...")
-        chunk_texts = [chunk.content for chunk in chunks]
+        logger.info(
+            f"Building FAISS index with "
+            f"{len(chunks)} chunks..."
+        )
 
-        embeddings = generate_embeddings(chunk_texts, model_name=self.model, batch_size=self.batch_size, dimensions=self.embedding_dim, apikey=apikey, max_workers=10)
+        # ----------------------------------------------------
+        # Extract chunk text
+        # ----------------------------------------------------
 
-        if embeddings is None or embeddings.shape[0] == 0:
-            logger.error("Failed to generate embeddings. Index not built.")
+        chunk_texts = [
+            chunk.content
+            for chunk in chunks
+        ]
+
+        # ----------------------------------------------------
+        # Generate Ollama embeddings
+        # ----------------------------------------------------
+
+        embeddings = generate_embeddings(
+            texts=chunk_texts,
+            model_name=self.model,
+            batch_size=self.batch_size,
+            dimensions=self.embedding_dim,
+            apikey=apikey,
+            max_workers=4
+        )
+
+        if (
+            embeddings is None
+            or embeddings.shape[0] == 0
+        ):
+
+            logger.error(
+                "Failed to generate embeddings. "
+                "Index not built."
+            )
+
             return False
+
+        # ----------------------------------------------------
+        # Validate dimensions
+        # ----------------------------------------------------
 
         if embeddings.shape[1] != self.embedding_dim:
-            logger.error(f"Generated embeddings dimension ({embeddings.shape[1]}) does not match configured dimension ({self.embedding_dim}). Index not built.")
-            # Update config or check embedding model if this happens
-            # config.EMBEDDING_DIMENSIONS = embeddings.shape[1] # Risky, better to fix model or config
+
+            logger.error(
+                f"Generated embedding dimension "
+                f"({embeddings.shape[1]}) does not match "
+                f"configured dimension "
+                f"({self.embedding_dim})."
+            )
+
             return False
 
-        # Initialize FAISS index (IndexFlatL2 is a common choice for exact search)
-        # For larger datasets, consider more advanced index types like IndexIVFFlat.
-        self.index = faiss.IndexFlatL2(self.embedding_dim)
-        self.index.add(embeddings)
-        logger.info(f"FAISS index built. Total vectors: {self.index.ntotal}")
+        # ----------------------------------------------------
+        # Create FAISS index
+        # ----------------------------------------------------
 
-        # Prepare and save metadata
+        self.index = faiss.IndexFlatL2(
+            self.embedding_dim
+        )
+
+        self.index.add(embeddings)
+
+        logger.info(
+            f"FAISS index built successfully. "
+            f"Total vectors: {self.index.ntotal}"
+        )
+
+        # ----------------------------------------------------
+        # Create metadata
+        # ----------------------------------------------------
+
         self.chunk_metadata = []
+
         for i, chunk in enumerate(chunks):
-            # Store essential metadata. Convert Path objects to strings for JSON serialization.
-            meta_item = chunk.model_dump(exclude={'absolute_path'}) # Exclude large fields or non-serializable
-            meta_item['original_file_path'] = str(chunk.original_file_path)
-            meta_item['file_path'] = str(chunk.file_path) # This is the chunk's unique path
-            meta_item['vector_id'] = i # Simple mapping: vector index in FAISS = index in this list
-            self.chunk_metadata.append(meta_item)
+
+            meta_item = chunk.model_dump(
+                exclude={"absolute_path"}
+            )
+
+            meta_item[
+                "original_file_path"
+            ] = str(
+                chunk.original_file_path
+            )
+
+            meta_item[
+                "file_path"
+            ] = str(
+                chunk.file_path
+            )
+
+            meta_item[
+                "vector_id"
+            ] = i
+
+            self.chunk_metadata.append(
+                meta_item
+            )
+
+        # ----------------------------------------------------
+        # Save index
+        # ----------------------------------------------------
 
         self.save_index()
+
         return True
 
+    # ========================================================
+    # SAVE INDEX
+    # ========================================================
+
     def save_index(self):
-        """Saves the FAISS index and metadata to disk."""
-        if self.index:
-            logger.info(f"Saving FAISS index to: {self.index_file_path}")
-            faiss.write_index(self.index, str(self.index_file_path))
+
+        if self.index is not None:
+
+            logger.info(
+                f"Saving FAISS index to: "
+                f"{self.index_file_path}"
+            )
+
+            faiss.write_index(
+                self.index,
+                str(self.index_file_path)
+            )
+
         else:
-            logger.warning("No FAISS index to save.")
+
+            logger.warning(
+                "No FAISS index to save."
+            )
 
         if self.chunk_metadata:
-            logger.info(f"Saving metadata to: {self.metadata_file_path}")
-            with open(self.metadata_file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.chunk_metadata, f, indent=2)
+
+            logger.info(
+                f"Saving metadata to: "
+                f"{self.metadata_file_path}"
+            )
+
+            with open(
+                self.metadata_file_path,
+                "w",
+                encoding="utf-8"
+            ) as f:
+
+                json.dump(
+                    self.chunk_metadata,
+                    f,
+                    indent=2
+                )
+
         else:
-            logger.warning("No metadata to save.")
+
+            logger.warning(
+                "No metadata to save."
+            )
+
+    # ========================================================
+    # LOAD INDEX
+    # ========================================================
 
     def load_index(self) -> bool:
-        """Loads the FAISS index and metadata from disk."""
-        if not self.index_file_path.exists() or not self.metadata_file_path.exists():
-            logger.warning(f"Index files not found in {self.index_dir}. Cannot load index.")
+
+        if (
+            not self.index_file_path.exists()
+            or not self.metadata_file_path.exists()
+        ):
+
+            logger.warning(
+                f"Index files not found in "
+                f"{self.index_dir}."
+            )
+
             return False
 
         try:
-            logger.info(f"Loading FAISS index from: {self.index_file_path}")
-            self.index = faiss.read_index(str(self.index_file_path))
-            logger.info(f"FAISS index loaded. Total vectors: {self.index.ntotal}, Dimensions: {self.index.d}")
+
+            logger.info(
+                f"Loading FAISS index from: "
+                f"{self.index_file_path}"
+            )
+
+            self.index = faiss.read_index(
+                str(self.index_file_path)
+            )
+
+            logger.info(
+                f"FAISS index loaded. "
+                f"Vectors: {self.index.ntotal}, "
+                f"Dimensions: {self.index.d}"
+            )
 
             if self.index.d != self.embedding_dim:
-                logger.warning(f"Loaded index dimension ({self.index.d}) differs from configured ({self.embedding_dim}). This might cause issues.")
-                # self.embedding_dim = self.index.d # Update if needed
 
-            logger.info(f"Loading metadata from: {self.metadata_file_path}")
-            with open(self.metadata_file_path, 'r', encoding='utf-8') as f:
+                logger.warning(
+                    f"Loaded index dimension "
+                    f"({self.index.d}) differs from "
+                    f"configured dimension "
+                    f"({self.embedding_dim})."
+                )
+
+            logger.info(
+                f"Loading metadata from: "
+                f"{self.metadata_file_path}"
+            )
+
+            with open(
+                self.metadata_file_path,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
                 self.chunk_metadata = json.load(f)
-            logger.info(f"Metadata loaded for {len(self.chunk_metadata)} chunks.")
+
+            logger.info(
+                f"Metadata loaded for "
+                f"{len(self.chunk_metadata)} chunks."
+            )
+
+            # Validate vector/metadata count
+
+            if (
+                self.index.ntotal
+                != len(self.chunk_metadata)
+            ):
+
+                logger.warning(
+                    f"Vector count "
+                    f"({self.index.ntotal}) does not "
+                    f"match metadata count "
+                    f"({len(self.chunk_metadata)})."
+                )
+
             return True
+
         except Exception as e:
-            logger.error(f"Error loading FAISS index or metadata: {e}")
+
+            logger.error(
+                f"Error loading FAISS index "
+                f"or metadata: {e}"
+            )
+
             self.index = None
+
             self.chunk_metadata = []
+
             return False
 
-    def search(self,
-               query_text: str,
-               top_k: int = config.RETRIEVAL_VECTOR_TOP_K,
-               model: str = config.EMBEDDING_MODEL_NAME,
-               batch_size: int = config.EMBEDDING_BATCH_SIZE,
-               dimensions: int = config.EMBEDDING_DIMENSIONS,
-               apikey: Optional[str] = None) -> List[Tuple[float, Dict[str, Any]]]:
-        """
-        Searches the index for a query text.
+    # ========================================================
+    # SEARCH
+    # ========================================================
 
-        Args:
-            query_text (str): The text to search for.
-            top_k (int): The number of top results to return.
+    def search(
+        self,
+        query_text: str,
+        top_k: int = config.RETRIEVAL_VECTOR_TOP_K,
+        model: str = config.EMBEDDING_MODEL_NAME,
+        batch_size: int = config.EMBEDDING_BATCH_SIZE,
+        dimensions: int = config.EMBEDDING_DIMENSIONS,
+        apikey: Optional[str] = None
+    ) -> List[
+        Tuple[float, Dict[str, Any]]
+    ]:
 
-        Returns:
-            List[Tuple[float, Dict[str, Any]]]: A list of (score, metadata) tuples.
-                                                Score is distance (lower is better for L2).
-        """
+        # ----------------------------------------------------
+        # Make sure index is loaded
+        # ----------------------------------------------------
+
         if self.index is None:
-            logger.warning("FAISS Index not loaded or built. Cannot perform search.")
-            if not self.load_index(): # Try to load if not already
+
+            logger.info(
+                "FAISS index not loaded. "
+                "Attempting to load..."
+            )
+
+            if not self.load_index():
+
+                logger.warning(
+                    "Could not load FAISS index."
+                )
+
                 return []
 
-        if self.index is None: # Check again after attempting load
-            logger.error("Failed to load index for search.")
+        # ----------------------------------------------------
+        # Generate query embedding
+        # ----------------------------------------------------
+
+        logger.debug(
+            f"Searching for query: "
+            f"'{query_text[:80]}...'"
+        )
+
+        query_embedding = generate_embeddings(
+            texts=[query_text],
+            model_name=model,
+            batch_size=batch_size,
+            dimensions=dimensions,
+            apikey=apikey,
+            max_workers=1
+        )
+
+        if (
+            query_embedding is None
+            or query_embedding.shape[0] == 0
+        ):
+
+            logger.error(
+                "Failed to generate query embedding."
+            )
+
             return []
 
+        # ----------------------------------------------------
+        # Validate dimensions
+        # ----------------------------------------------------
 
-        logger.debug(f"Searching index for query: '{query_text[:50]}...' (top_k={top_k})")
-        query_embedding = generate_embeddings(texts=[query_text], apikey=apikey, model_name=model, batch_size=batch_size, dimensions=dimensions, max_workers=1)
+        if query_embedding.shape[1] != self.index.d:
 
-        if query_embedding is None or query_embedding.shape[0] == 0:
-            logger.error("Failed to generate embedding for query. Search aborted.")
+            logger.error(
+                f"Query embedding dimension "
+                f"({query_embedding.shape[1]}) does not "
+                f"match FAISS index dimension "
+                f"({self.index.d})."
+            )
+
             return []
 
-        # FAISS search returns distances (D) and indices (I)
-        # Distances are L2 distances (lower is better)
-        distances, indices = self.index.search(query_embedding, top_k)
+        # ----------------------------------------------------
+        # Limit top_k
+        # ----------------------------------------------------
+
+        actual_top_k = min(
+            top_k,
+            self.index.ntotal
+        )
+
+        if actual_top_k <= 0:
+
+            return []
+
+        # ----------------------------------------------------
+        # Search FAISS
+        # ----------------------------------------------------
+
+        distances, indices = self.index.search(
+            query_embedding,
+            actual_top_k
+        )
 
         results = []
-        if indices.size > 0:
-            for i in range(indices.shape[1]): # Iterate through top_k results for the query
-                vector_id = indices[0, i]
-                distance = distances[0, i]
-                if vector_id < 0 or vector_id >= len(self.chunk_metadata): # faiss can return -1 if not enough results
-                    logger.warning(f"Invalid vector_id {vector_id} from FAISS search. Skipping.")
-                    continue
 
-                # Convert L2 distance to a similarity score (e.g., 1 / (1 + distance)) if desired,
-                # or just use distance. For now, returning distance.
-                results.append((float(distance), self.chunk_metadata[vector_id]))
+        for i in range(
+            indices.shape[1]
+        ):
 
-        logger.debug(f"Search returned {len(results)} results.")
+            vector_id = int(
+                indices[0, i]
+            )
+
+            distance = float(
+                distances[0, i]
+            )
+
+            if (
+                vector_id < 0
+                or vector_id
+                >= len(self.chunk_metadata)
+            ):
+
+                logger.warning(
+                    f"Invalid vector ID "
+                    f"{vector_id}. Skipping."
+                )
+
+                continue
+
+            metadata = (
+                self.chunk_metadata[
+                    vector_id
+                ]
+            )
+
+            results.append(
+                (
+                    distance,
+                    metadata
+                )
+            )
+
+        logger.debug(
+            f"Search returned "
+            f"{len(results)} results."
+        )
+
         return results
 
 
-# --- Example Usage ---
+# ============================================================
+# TEST
+# ============================================================
+
 if __name__ == "__main__":
-    from src.data_processing.chunkers import DocumentChunk
-    from pathlib import Path
+
     logger.remove()
-    logger.add(lambda msg: print(msg, end=""), level="INFO")
 
-    # Create dummy chunks for testing
+    logger.add(
+        lambda msg: print(
+            msg,
+            end=""
+        ),
+        level="INFO"
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+    logger.info(
+        "Testing Ollama + FAISS Vector Index"
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+    # --------------------------------------------------------
+    # Test Ollama connection
+    # --------------------------------------------------------
+
+    try:
+
+        response = requests.get(
+            f"{config.OLLAMA_BASE_URL}/api/tags",
+            timeout=10
+        )
+
+        response.raise_for_status()
+
+        models = response.json().get(
+            "models",
+            []
+        )
+
+        model_names = [
+            model.get("name")
+            for model in models
+        ]
+
+        logger.info(
+            f"Ollama models available: "
+            f"{model_names}"
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Could not connect to Ollama: {e}"
+        )
+
+        raise SystemExit(1)
+
+    # --------------------------------------------------------
+    # Create dummy chunks
+    # --------------------------------------------------------
+
     dummy_chunks_data = [
-        {"file_path": Path("test.py_chunk_1"), "content": "def hello(): return 'world'", "language": "python", "original_file_path": Path("test.py"), "chunk_id":1, "size_bytes":30, "absolute_path": Path("/abs/test.py")},
-        {"file_path": Path("test.py_chunk_2"), "content": "class Greeter: def greet(self): print('Hello')", "language": "python", "original_file_path": Path("test.py"), "chunk_id":2, "size_bytes":50, "absolute_path": Path("/abs/test.py")},
-        {"file_path": Path("other.js_chunk_1"), "content": "function test() { return 1+1; }", "language": "javascript", "original_file_path": Path("other.js"), "chunk_id":1, "size_bytes":40, "absolute_path": Path("/abs/other.js")},
+
+        {
+            "file_path": Path(
+                "test.py_chunk_1"
+            ),
+
+            "content":
+                "def hello(): "
+                "return 'world'",
+
+            "language":
+                "python",
+
+            "original_file_path":
+                Path("test.py"),
+
+            "chunk_id":
+                1,
+
+            "size_bytes":
+                30,
+
+            "absolute_path":
+                Path("/abs/test.py")
+        },
+
+        {
+            "file_path": Path(
+                "test.py_chunk_2"
+            ),
+
+            "content":
+                "class Greeter: "
+                "def greet(self): "
+                "print('Hello')",
+
+            "language":
+                "python",
+
+            "original_file_path":
+                Path("test.py"),
+
+            "chunk_id":
+                2,
+
+            "size_bytes":
+                50,
+
+            "absolute_path":
+                Path("/abs/test.py")
+        },
+
+        {
+            "file_path": Path(
+                "other.js_chunk_1"
+            ),
+
+            "content":
+                "function test() "
+                "{ return 1+1; }",
+
+            "language":
+                "javascript",
+
+            "original_file_path":
+                Path("other.js"),
+
+            "chunk_id":
+                1,
+
+            "size_bytes":
+                40,
+
+            "absolute_path":
+                Path("/abs/other.js")
+        }
     ]
-    test_chunks = [DocumentChunk(**data) for data in dummy_chunks_data]
 
-    # Initialize Vector Index
-    # Ensure config.INDEX_DIR is writable or change to a temp dir for testing
-    test_index_dir = config.INDEX_DIR / "test_vector_index"
-    vector_indexer = FaissVectorIndex(index_dir=test_index_dir, embedding_dim=config.EMBEDDING_DIMENSIONS)
+    test_chunks = [
+        DocumentChunk(**data)
+        for data in dummy_chunks_data
+    ]
 
+    # --------------------------------------------------------
+    # Initialize index
+    # --------------------------------------------------------
+
+    test_index_dir = (
+        config.INDEX_DIR
+        / "test_vector_index"
+    )
+
+    vector_indexer = FaissVectorIndex(
+        index_dir=test_index_dir,
+        embedding_dim=
+            config.EMBEDDING_DIMENSIONS
+    )
+
+    # --------------------------------------------------------
     # Build index
-    logger.info("\n--- Building Vector Index ---")
-    build_success = vector_indexer.build_index(test_chunks, force_rebuild=True)
+    # --------------------------------------------------------
 
-    if build_success:
-        logger.info("Index built successfully.")
+    logger.info(
+        "\n--- Building Vector Index ---"
+    )
 
-        # Test loading the index (as if in a new session)
-        logger.info("\n--- Testing Index Loading ---")
-        loaded_vector_indexer = FaissVectorIndex(index_dir=test_index_dir, embedding_dim=config.EMBEDDING_DIMENSIONS)
-        load_success = loaded_vector_indexer.load_index()
+    build_success = (
+        vector_indexer.build_index(
+            test_chunks,
+            force_rebuild=True
+        )
+    )
 
-        if load_success:
-            logger.info("Index loaded successfully.")
-            # Test search
-            logger.info("\n--- Testing Search ---")
-            query = "python hello world function"
-            search_results = loaded_vector_indexer.search(query, top_k=2)
+    if not build_success:
 
-            logger.info(f"Search results for '{query}':")
-            for score, meta in search_results:
-                logger.info(f"  Score (Distance): {score:.4f}, Chunk Original Path: {meta['original_file_path']}, Chunk ID: {meta['chunk_id']}")
-                # logger.info(f"     Content: {meta['content'][:50]}...") # content is not in meta by default
+        logger.error(
+            "Failed to build vector index."
+        )
 
-            # A simple check
-            if search_results:
-                assert "test.py" in str(search_results[0][1]['original_file_path']), "Search result mismatch"
-                logger.info("Basic search assertion passed.")
+        raise SystemExit(1)
 
-        else:
-            logger.error("Failed to load the index for testing.")
+    logger.info(
+        "Index built successfully."
+    )
+
+    # --------------------------------------------------------
+    # Load index
+    # --------------------------------------------------------
+
+    logger.info(
+        "\n--- Testing Index Loading ---"
+    )
+
+    loaded_vector_indexer = (
+        FaissVectorIndex(
+            index_dir=test_index_dir,
+            embedding_dim=
+                config.EMBEDDING_DIMENSIONS
+        )
+    )
+
+    load_success = (
+        loaded_vector_indexer.load_index()
+    )
+
+    if not load_success:
+
+        logger.error(
+            "Failed to load vector index."
+        )
+
+        raise SystemExit(1)
+
+    logger.info(
+        "Index loaded successfully."
+    )
+
+    # --------------------------------------------------------
+    # Search
+    # --------------------------------------------------------
+
+    logger.info(
+        "\n--- Testing Search ---"
+    )
+
+    query = (
+        "python hello world function"
+    )
+
+    search_results = (
+        loaded_vector_indexer.search(
+            query,
+            top_k=2
+        )
+    )
+
+    logger.info(
+        f"Search results for: "
+        f"'{query}'"
+    )
+
+    for score, meta in search_results:
+
+        logger.info(
+            f"  Distance: {score:.4f}"
+        )
+
+        logger.info(
+            f"  File: "
+            f"{meta['original_file_path']}"
+        )
+
+        logger.info(
+            f"  Chunk ID: "
+            f"{meta['chunk_id']}"
+        )
+
+    if search_results:
+
+        logger.info(
+            "Basic vector search "
+            "assertion passed."
+        )
+
     else:
-        logger.error("Failed to build the index for testing.")
 
-    # Clean up test index directory (optional)
-    # import shutil
-    # if test_index_dir.exists():
-    #     shutil.rmtree(test_index_dir)
-    #     logger.info(f"Cleaned up test index directory: {test_index_dir}")
+        logger.error(
+            "No search results returned."
+        )
+
+        raise SystemExit(1)
+
+    logger.info(
+        "========================================"
+    )
+
+    logger.info(
+        "OLLAMA + FAISS TEST PASSED"
+    )
+
+    logger.info(
+        "========================================"
+    )
