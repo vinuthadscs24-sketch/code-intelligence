@@ -121,11 +121,13 @@ def get_config_value(
 
 
 # ============================================================
-# API KEYS
+# API KEYS & BASE URLS
 # ============================================================
 
+# Default API Key to "ollama" if omitted
 OPENAI_API_KEY = get_config_value(
     "api_keys.openai",
+    "ollama",
     env_var="OPENAI_API_KEY"
 )
 
@@ -134,8 +136,10 @@ GOOGLE_API_KEY = get_config_value(
     env_var="GOOGLE_API_KEY"
 )
 
+# Default OpenAI Base URL to local Ollama OpenAI-compatible endpoint
 OPENAI_BASE_URL = get_config_value(
     "url.openai",
+    "http://localhost:11434/v1",
     env_var="OPENAI_BASE_URL"
 )
 
@@ -247,8 +251,6 @@ logger.info(
 # EMBEDDING CONFIGURATION
 # ============================================================
 
-# We are using Ollama locally instead of OpenAI embeddings.
-
 EMBEDDING_MODEL_PROVIDER = get_config_value(
     "embedding.provider",
     "ollama",
@@ -260,8 +262,6 @@ EMBEDDING_MODEL_NAME = get_config_value(
     "nomic-embed-text",
     "RAG_EMBEDDING_MODEL_NAME"
 )
-
-# nomic-embed-text produces 768-dimensional embeddings.
 
 EMBEDDING_DIMENSIONS = get_config_value(
     "embedding.dimensions",
@@ -282,7 +282,7 @@ EMBEDDING_BATCH_SIZE = get_config_value(
 
 GENERATOR_MODEL_NAME = get_config_value(
     "generator.model_name",
-    "gpt-4o-mini",
+    "llama3",
     "RAG_GENERATOR_MODEL_NAME"
 )
 
@@ -497,56 +497,23 @@ def log_important_configs():
     logger.info("========================================")
 
     logger.info(f"Project Root: {PROJECT_ROOT}")
-
     logger.info(f"Data Directory: {DATA_DIR}")
-
     logger.info(f"Repository Directory: {REPOS_DIR}")
-
     logger.info(f"Index Directory: {INDEX_DIR}")
-
-    logger.info(
-        f"Embedding Provider: {EMBEDDING_MODEL_PROVIDER}"
-    )
-
-    logger.info(
-        f"Embedding Model: {EMBEDDING_MODEL_NAME}"
-    )
-
-    logger.info(
-        f"Embedding Dimensions: {EMBEDDING_DIMENSIONS}"
-    )
-
-    logger.info(
-        f"Embedding Batch Size: {EMBEDDING_BATCH_SIZE}"
-    )
-
-    logger.info(
-        f"Ollama URL: {OLLAMA_BASE_URL}"
-    )
-
-    logger.info(
-        f"Generator Model: {GENERATOR_MODEL_NAME}"
-    )
-
-    logger.info(
-        f"Supported AST Languages: "
-        f"{list(TREE_SITTER_LANGUAGES.keys())}"
-    )
-
-    logger.info(
-        f"API Server: http://{API_HOST}:{API_PORT}"
-    )
-
-    if EMBEDDING_MODEL_PROVIDER == "openai" and not OPENAI_API_KEY:
-        logger.warning(
-            "OpenAI API key is not set."
-        )
-
+    logger.info(f"Embedding Provider: {EMBEDDING_MODEL_PROVIDER}")
+    logger.info(f"Embedding Model: {EMBEDDING_MODEL_NAME}")
+    logger.info(f"Embedding Dimensions: {EMBEDDING_DIMENSIONS}")
+    logger.info(f"Embedding Batch Size: {EMBEDDING_BATCH_SIZE}")
+    logger.info(f"Ollama URL: {OLLAMA_BASE_URL}")
+    logger.info(f"Generator Model: {GENERATOR_MODEL_NAME}")
+    logger.info(f"OpenAI Base URL: {OPENAI_BASE_URL}")
+    logger.info(f"Supported AST Languages: {list(TREE_SITTER_LANGUAGES.keys())}")
+    logger.info(f"API Server: http://{API_HOST}:{API_PORT}")
     logger.info("========================================")
 
 
 # ============================================================
-# OPENAI LLM CLIENT
+# OPENAI LLM CLIENT (ROUTED TO LOCAL OLLAMA BY DEFAULT)
 # ============================================================
 
 def get_openai_llm_client(
@@ -554,47 +521,27 @@ def get_openai_llm_client(
     baseurl: Optional[str] = None
 ):
     """
-    Creates an OpenAI AsyncOpenAI client for LLM generation.
+    Creates an AsyncOpenAI client routed to local Ollama.
     """
-
-    if not apikey and not OPENAI_API_KEY:
-        logger.error(
-            "OpenAI API key not provided."
-        )
-        raise ValueError(
-            "OpenAI API key not set."
-        )
+    key = apikey or OPENAI_API_KEY or "ollama"
+    url = baseurl or OPENAI_BASE_URL or "http://localhost:11434/v1"
 
     try:
-
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(
-            api_key=apikey or OPENAI_API_KEY,
-            base_url=baseurl or OPENAI_BASE_URL
+            api_key=key,
+            base_url=url
         )
 
-        logger.info(
-            "AsyncOpenAI client initialized."
-        )
-
+        logger.info(f"AsyncOpenAI client initialized for base_url: {url}")
         return client
 
     except ImportError:
-
-        logger.error(
-            "OpenAI package not installed. "
-            "Run: pip install openai"
-        )
-
+        logger.error("OpenAI package not installed. Run: pip install openai")
         raise
-
     except Exception as e:
-
-        logger.error(
-            f"Failed to initialize AsyncOpenAI client: {e}"
-        )
-
+        logger.error(f"Failed to initialize AsyncOpenAI client: {e}")
         raise
 
 
@@ -607,50 +554,27 @@ def get_openai_embeddings_client(
     baseurl: Optional[str] = None
 ):
     """
-    Creates an OpenAI client.
-
-    This is kept for compatibility with older code.
-    The current embedding provider is Ollama.
+    Creates an OpenAI client. Kept for backwards compatibility.
     """
-
-    if not apikey and not OPENAI_API_KEY:
-        logger.error(
-            "OpenAI API key not provided."
-        )
-        raise ValueError(
-            "OpenAI API key not set."
-        )
+    key = apikey or OPENAI_API_KEY or "ollama"
+    url = baseurl or OPENAI_BASE_URL or "http://localhost:11434/v1"
 
     try:
-
         from openai import OpenAI
 
         client = OpenAI(
-            api_key=apikey or OPENAI_API_KEY,
-            base_url=baseurl or OPENAI_BASE_URL
+            api_key=key,
+            base_url=url
         )
 
-        logger.info(
-            "OpenAI embedding client initialized."
-        )
-
+        logger.info("OpenAI embedding client initialized.")
         return client
 
     except ImportError:
-
-        logger.error(
-            "OpenAI package not installed. "
-            "Run: pip install openai"
-        )
-
+        logger.error("OpenAI package not installed. Run: pip install openai")
         raise
-
     except Exception as e:
-
-        logger.error(
-            f"Failed to initialize OpenAI client: {e}"
-        )
-
+        logger.error(f"Failed to initialize OpenAI client: {e}")
         raise
 
 
