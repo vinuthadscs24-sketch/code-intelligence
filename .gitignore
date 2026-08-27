@@ -15,7 +15,16 @@ data/indexes/
 nltk_data/
 *.log
 
+<<<<<<< HEAD
 # IDE & OS Files
 .vscode/
 .idea/
 .DS_Store
+=======
+
+data/repositories/
+logs/
+data/indexes/
+*.pkl
+*.faiss
+>>>>>>> c90a4aa (Add RAG pipeline and frontend)
