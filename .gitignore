@@ -31,3 +31,7 @@ data/indexes/
 
 cache/
 real_java_repo/
+
+debug_parser.py
+test_parser_audit.py
+workspace/
