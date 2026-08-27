@@ -1,10 +1,13 @@
-import sys
-import argparse
-import tempfile
+import os
 import shutil
-import subprocess
+import tempfile
 from pathlib import Path
+from typing import Dict, Any, List, Optional
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi.middleware.cors import CORSMiddleware
 
+# Import core engine modules
 from src.repo_utils import clone_repo_if_url
 from src.parser import JavaASTParser
 from src.chunker import CodeChunker
@@ -15,87 +18,90 @@ from src.context_builder import CodeIntelligenceContextBuilder
 from src.llm_engine import CodeIntelligenceEngine
 
 
-def clone_repo_if_url(repo_input: str) -> tuple[Path, bool]:
+app = FastAPI(
+    title="AI Codebase Intelligence Engine",
+    description="REST API for Hybrid RRF Code Retrieval, Knowledge Graph Queries, Transitive Impact Analysis, and LLM Reasoning.",
+    version="1.0.0"
+)
+
+# Enable CORS for React/Tailwind frontend integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global State Container
+class EngineState:
+    repo_path: Optional[Path] = None
+    is_temp: bool = False
+    parser: Optional[JavaASTParser] = None
+    chunker: Optional[CodeChunker] = None
+    graph_db: Optional[CodeKnowledgeGraph] = None
+    vector_store: Optional[VectorStore] = None
+    git_intel: Optional[GitIntelligence] = None
+    context_builder: Optional[CodeIntelligenceContextBuilder] = None
+    engine: Optional[CodeIntelligenceEngine] = None
+    is_indexed: bool = False
+
+
+state = EngineState()
+
+
+# --- Request/Response Models ---
+
+class IndexRequest(BaseModel):
+    repo_path_or_url: str = Field(..., example="https://github.com/spring-projects/spring-petclinic.git")
+    rebuild_index: bool = Field(False, description="Force rebuilding FAISS vector index")
+
+
+class QueryRequest(BaseModel):
+    question: str = Field(..., example="How does user authentication work in this codebase?")
+    top_k: int = Field(5, ge=1, le=20)
+
+
+class ProvenanceRequest(BaseModel):
+    file: str = Field(..., example="src/main/java/com/example/UserService.java")
+    method: str = Field(..., example="createUser")
+    start_line: int = Field(..., ge=1)
+    end_line: int = Field(..., ge=1)
+
+
+# --- API Endpoints ---
+
+@app.get("/health")
+def health_check():
+    """Returns engine indexing and repository readiness status."""
+    return {
+        "status": "online",
+        "indexed": state.is_indexed,
+        "repo_path": str(state.repo_path) if state.repo_path else None
+    }
+
+
+@app.post("/index")
+def index_repository(payload: IndexRequest):
     """
-    Checks if repo_input is a Git URL.
-    If yes, clones it into a temporary directory and returns (temp_path, True).
-    If no, treats it as a local path and returns (Path(repo_input), False).
+    Clones (if URL) or loads a local Java repository, parses ASTs, builds
+    the Knowledge Graph, and populates FAISS vector embeddings.
     """
-    is_url = (
-        repo_input.startswith("http://") 
-        or repo_input.startswith("https://") 
-        or repo_input.startswith("git@") 
-        or repo_input.endswith(".git")
-    )
-    if is_url:
-        temp_dir = tempfile.mkdtemp(prefix="repo_clone_")
-        print(f"\n[Git] Cloning repository from '{repo_input}' into temporary directory...")
-        try:
-            subprocess.run(
-                ["git", "clone", "--depth", "1", repo_input, temp_dir],
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            return Path(temp_dir), True
-        except subprocess.CalledProcessError as e:
-            print(f"[Error] Failed to clone repository:\n{e.stderr}")
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            sys.exit(1)
-        except Exception as e:
-            print(f"[Error] Unexpected error cloning repository: {e}")
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            sys.exit(1)
-    else:
-        return Path(repo_input), False
-
-
-def main():
-    cli_parser = argparse.ArgumentParser(
-        description="Codebase Vector & Knowledge Graph Search Engine"
-    )
-    cli_parser.add_argument(
-        "repo_path", 
-        nargs="?", 
-        default=None, 
-        help="Path or GitHub repository URL to analyze"
-    )
-    cli_parser.add_argument(
-        "--mode",
-        choices=["interactive", "why-changed"],
-        default="interactive",
-        help="Mode to run: 'interactive' search or 'why-changed' method provenance query"
-    )
-    cli_parser.add_argument("--file", type=str, help="Relative file path for --mode why-changed")
-    cli_parser.add_argument("--method", type=str, help="Method name for --mode why-changed")
-    cli_parser.add_argument("--start", type=int, help="Start line number for --mode why-changed")
-    cli_parser.add_argument("--end", type=int, help="End line number for --mode why-changed")
-    cli_parser.add_argument("--rebuild-index", action="store_true", help="Force rebuild of FAISS index")
-
-    args = cli_parser.parse_args()
-
-    if not args.repo_path:
-        repo_input = input("Enter path or Git repository URL (default: .): ").strip()
-        repo_input = repo_input if repo_input else "."
-    else:
-        repo_input = args.repo_path
-
-    repo_path, is_temp = clone_repo_if_url(repo_input)
-
     try:
-        if not repo_path.exists() or not repo_path.is_dir():
-            print(f"Error: Directory '{repo_path}' does not exist.")
-            sys.exit(1)
+        # Clean up existing temporary repository if active
+        if state.is_temp and state.repo_path and state.repo_path.exists():
+            shutil.rmtree(state.repo_path, ignore_errors=True)
 
-        print(f"\n[1/5] Parsing repository at '{repo_path}'...")
+        repo_path, is_temp = clone_repo_if_url(payload.repo_path_or_url)
+        if not repo_path.exists() or not repo_path.is_dir():
+            raise HTTPException(status_code=400, detail=f"Directory '{repo_path}' does not exist.")
+
+        # 1. Parse AST
         parser = JavaASTParser()
         extracted_data = []
-
         for java_file in repo_path.rglob("*.java"):
-            # Skip module and package metadata descriptors
             if java_file.name in {"module-info.java", "package-info.java"}:
                 continue
-
             try:
                 result = parser.parse_file(str(java_file))
                 if result:
@@ -106,46 +112,33 @@ def main():
                         source_code = result[1] if len(result) > 1 else ""
                         symbols = parser.extract_symbols_and_relations(tree, source_code)
                         extracted_data.append((Path(java_file), {
-                            "tree": tree, 
+                            "tree": tree,
                             "source_code": source_code,
                             "symbols": symbols
                         }))
             except Exception:
-                # Silently skip parsing errors on complex/non-standard syntax
                 pass
 
         if not extracted_data:
-            print(f"No Java files found or successfully parsed in '{repo_path}'.")
-            sys.exit(1)
+            raise HTTPException(status_code=400, detail="No valid Java files found or parsed.")
 
-        print(f"Parsed {len(extracted_data)} Java file(s).")
-
-        print("\n[2/5] Generating AST chunks...")
+        # 2. Chunking
         chunker = CodeChunker(parser=parser)
         chunks = chunker.create_chunks(extracted_data)
-        print(f"Total Chunks Created: {len(chunks)}")
 
-        print("\n[3/5] Building Code Knowledge Graph...")
+        # 3. Knowledge Graph
         kg = CodeKnowledgeGraph()
         kg.build_graph_from_chunks(chunks)
-        summary = kg.get_summary()
-        print(f"Graph Built: {summary['total_nodes']} nodes, {summary['total_edges']} edges.")
 
-        print("\n[4/5] Initializing FAISS Vector Index...")
+        # 4. Vector Store
         store = VectorStore()
-        
-        # Load cached index or generate embeddings if missing or requested
-        if args.rebuild_index or not store.load_index():
-            print("Building new vector index...")
+        if payload.rebuild_index or not store.load_index():
             store.build_index(chunks)
             store.save_index()
-        else:
-            print("FAISS vector index ready.")
 
-        print("\n[5/5] Initializing Intelligence Engine & Context Builder...")
+        # 5. Git & Context Engine
         git_intel = GitIntelligence(repo_path=str(repo_path))
         context_builder = CodeIntelligenceContextBuilder(git_intel=git_intel)
-        
         engine = CodeIntelligenceEngine(
             repo_path=str(repo_path),
             vector_store=store,
@@ -153,63 +146,122 @@ def main():
             context_builder=context_builder
         )
 
-        # Mode 1: Provenance check via CLI parameters
-        if args.mode == "why-changed":
-            if not all([args.file, args.method, args.start, args.end]):
-                print("Error: --mode why-changed requires --file, --method, --start, and --end parameters.")
-                sys.exit(1)
-            
-            res = engine.explain_why_changed(args.file, args.method, args.start, args.end)
-            print("\n" + "="*80)
-            print(f" PROVENANCE ANALYSIS: {args.method}() in {args.file}")
-            print("="*80)
-            print(res.get("answer", "No response generated."))
-            print("="*80)
-            return
+        # Update State
+        state.repo_path = repo_path
+        state.is_temp = is_temp
+        state.parser = parser
+        state.chunker = chunker
+        state.graph_db = kg
+        state.vector_store = store
+        state.git_intel = git_intel
+        state.context_builder = context_builder
+        state.engine = engine
+        state.is_indexed = True
 
-        # Mode 2: Interactive CLI Search Loop
-        print("\n==================================================")
-        print("     FAISS Vector, Graph & LLM Engine Ready       ")
-        print("==================================================")
-        
-        while True:
-            try:
-                query = input("\nEnter code query or question (or 'exit' to quit): ").strip()
-                if not query or query.lower() == 'exit':
-                    break
+        summary = kg.get_summary()
+        return {
+            "message": "Repository indexed successfully.",
+            "total_files": len(extracted_data),
+            "total_chunks": len(chunks),
+            "graph_summary": summary
+        }
 
-                # Query Hybrid Retriever & Synthesize via LLM
-                response = engine.answer_query(query, top_k=5)
-                retrieved_chunks = response.get("retrieved_chunks", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Indexing failed: {str(e)}")
 
-                print(f"\n--- Top Hybrid Matches ({len(retrieved_chunks)}) ---")
-                for rank, chunk in enumerate(retrieved_chunks, start=1):
-                    chunk_id = chunk.get("chunk_id", "Unknown ID")
-                    chunk_type = chunk.get("chunk_type", "METHOD")
-                    file_name = Path(chunk.get("file_name", "unknown")).name
-                    method_name = chunk.get("method_name", "")
-                    callers = chunk.get("graph_callers", [])
-                    callees = chunk.get("graph_callees", [])
-                    code_snippet = chunk.get("code_content", chunk.get("text_representation", ""))[:200]
 
-                    print(f"\n[{rank}] ID: {chunk_id} | Type: {chunk_type}")
-                    print(f"    File: {file_name} | Method: {method_name}")
-                    if callers:
-                        print(f"    Callers (Graph): {', '.join(callers)}")
-                    if callees:
-                        print(f"    Callees (Graph): {', '.join(callees)}")
-                    print(f"    Snippet:\n{code_snippet}...\n")
-                
-                print("--- LLM Contextual Answer ---")
-                print(response.get("answer", "No response generated."))
+@app.post("/ask")
+def query_codebase(payload: QueryRequest):
+    """
+    Unified end-to-end Q&A endpoint.
+    Performs Hybrid RRF search, builds contextual prompts, and queries LLM.
+    """
+    if not state.is_indexed or not state.engine:
+        raise HTTPException(status_code=400, detail="No repository indexed. Call POST /index first.")
 
-            except KeyboardInterrupt:
-                break
+    try:
+        response = state.engine.answer_query(payload.question, top_k=payload.top_k)
+        return {
+            "query": payload.question,
+            "answer": response.get("answer", "No response generated."),
+            "retrieved_chunks": response.get("retrieved_chunks", []),
+            "context_used": response.get("context", {})
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
-    finally:
-        if is_temp and repo_path.exists():
-            print("\n[Git] Cleaning up temporary cloned repository...")
-            shutil.rmtree(repo_path, ignore_errors=True)
+
+@app.get("/dependencies/{entity_name}")
+def get_entity_dependencies(entity_name: str):
+    """Retrieves callers, callees, and imports for a class or method entity."""
+    if not state.is_indexed or not state.graph_db:
+        raise HTTPException(status_code=400, detail="No repository indexed.")
+
+    callers = state.graph_db.get_callers(entity_name)
+    callees = state.graph_db.get_callees(entity_name)
+
+    return {
+        "entity": entity_name,
+        "callers": callers,
+        "callees": callees
+    }
+
+
+@app.get("/impact/{entity_name}")
+def get_impact_analysis(
+    entity_name: str, 
+    max_depth: int = Query(3, ge=1, le=5)
+):
+    """Calculates multi-level transitive impact analysis using BFS across the Knowledge Graph."""
+    if not state.is_indexed or not state.graph_db:
+        raise HTTPException(status_code=400, detail="No repository indexed.")
+
+    from collections import deque
+    visited = {entity_name}
+    queue = deque([(entity_name, 0)])
+    affected_entities = []
+
+    while queue:
+        current_entity, distance = queue.popleft()
+        if distance >= max_depth:
+            continue
+
+        callers = state.graph_db.get_callers(current_entity)
+        for caller in callers:
+            if caller not in visited:
+                visited.add(caller)
+                affected_entities.append({
+                    "entity": caller,
+                    "distance": distance + 1
+                })
+                queue.append((caller, distance + 1))
+
+    return {
+        "target_entity": entity_name,
+        "max_depth": max_depth,
+        "total_affected": len(affected_entities),
+        "affected": affected_entities
+    }
+
+
+@app.post("/history/why-changed")
+def explain_method_provenance(payload: ProvenanceRequest):
+    """Explains why a specific method/line range changed using Git blame, show, and diff context."""
+    if not state.is_indexed or not state.engine:
+        raise HTTPException(status_code=400, detail="No repository indexed.")
+
+    try:
+        response = state.engine.explain_why_changed(
+            file_path=payload.file,
+            method_name=payload.method,
+            start_line=payload.start_line,
+            end_line=payload.end_line
+        )
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Provenance lookup failed: {str(e)}")
+
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

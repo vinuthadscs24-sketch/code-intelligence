@@ -1,286 +1,880 @@
 import json
-import re
 import networkx as nx
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Union
 
+
 class CodeKnowledgeGraph:
+
     def __init__(self):
         self.graph = nx.DiGraph()
 
-    def build_graph(self, repo_name: str, extracted_data: List[Tuple[Union[Path, str], dict]]):
-        """Constructs a directed graph with Spring DI, inheritance, and resolved call chains."""
+    # ============================================================
+    # BUILD GRAPH FROM PARSED DATA
+    # ============================================================
+
+    def build_graph(
+        self,
+        repo_name: str,
+        extracted_data: List[
+            Tuple[Union[Path, str], dict]
+        ]
+    ):
+
         self.graph.clear()
-        self.graph.add_node(repo_name, type="REPOSITORY")
 
-        class_type_map = {}   # class_name -> package/details
-        field_type_map = {}   # (class_name, field_name) -> field_type
+        self.graph.add_node(
+            repo_name,
+            type="REPOSITORY"
+        )
 
-        # Phase 1: Register Classes, Interfaces, Inheritance, and Fields
+        class_type_map = {}
+        field_type_map = {}
+
+        # --------------------------------------------------------
+        # Phase 1: Classes
+        # --------------------------------------------------------
+
         for file_path, symbols in extracted_data:
-            package = symbols.get("package", "default")
-            file_str = file_path.name if isinstance(file_path, Path) else str(file_path)
 
-            for cls in symbols.get("classes", []):
-                cls_name = cls["name"]
-                class_type_map[cls_name] = package
+            package = symbols.get(
+                "package",
+                "default"
+            )
+
+            file_str = (
+                file_path.name
+                if isinstance(file_path, Path)
+                else str(file_path)
+            )
+
+            for cls in symbols.get(
+                "classes",
+                []
+            ):
+
+                if isinstance(cls, str):
+                    cls_name = cls
+                    annotations = []
+                    extends = None
+                    implements = []
+
+                else:
+                    cls_name = cls.get(
+                        "name",
+                        "UnknownClass"
+                    )
+
+                    annotations = cls.get(
+                        "annotations",
+                        []
+                    )
+
+                    extends = cls.get(
+                        "extends"
+                    )
+
+                    implements = cls.get(
+                        "implements",
+                        []
+                    )
+
+                class_type_map[
+                    cls_name
+                ] = package
 
                 self.graph.add_node(
                     cls_name,
                     type="CLASS",
                     package=package,
-                    annotations=json.dumps(cls.get("annotations", [])),
+                    annotations=json.dumps(
+                        annotations
+                    ),
                     file=file_str
                 )
-                self.graph.add_edge(repo_name, cls_name, relation="CONTAINS")
 
-                if cls.get("extends"):
-                    parent = cls["extends"]
-                    self.graph.add_node(parent, type="CLASS")
-                    self.graph.add_edge(cls_name, parent, relation="EXTENDS")
-
-                for iface in cls.get("implements", []):
-                    self.graph.add_node(iface, type="INTERFACE")
-                    self.graph.add_edge(cls_name, iface, relation="IMPLEMENTS")
-
-            for iface in symbols.get("interfaces", []):
-                self.graph.add_node(iface, type="INTERFACE", package=package, file=file_str)
-                self.graph.add_edge(repo_name, iface, relation="CONTAINS")
-
-            for f in symbols.get("fields", []):
-                enclosing = f["enclosing_class"]
-                field_name = f["name"]
-                field_type = f["type"]
-                annotations = f.get("annotations", [])
-
-                field_type_map[(enclosing, field_name)] = field_type
-
-                is_injected = any(
-                    a for a in annotations if any(kw in a for kw in ["@Autowired", "@Inject", "@Resource"])
+                self.graph.add_edge(
+                    repo_name,
+                    cls_name,
+                    relation="CONTAINS"
                 )
 
-                if is_injected or field_type in class_type_map:
-                    self.graph.add_node(field_type, type="CLASS")
-                    self.graph.add_edge(
-                        enclosing, 
-                        field_type, 
-                        relation="INJECTS", 
-                        field_name=field_name,
-                        annotations=json.dumps(annotations)
-                    )
+                if extends:
 
-        # Phase 2: Add Methods & Resolve Method Calls
-        for file_path, symbols in extracted_data:
-            for m in symbols.get("methods", []):
-                m_name = m["name"]
-                enclosing = m.get("enclosing_class")
-
-                if enclosing:
-                    method_node_id = f"{enclosing}.{m_name}()"
                     self.graph.add_node(
-                        method_node_id,
-                        type="METHOD",
-                        name=m_name,
-                        annotations=json.dumps(m.get("annotations", []))
+                        extends,
+                        type="CLASS"
                     )
-                    self.graph.add_edge(enclosing, method_node_id, relation="HAS_METHOD")
 
-            for call in symbols.get("method_calls", []):
-                caller_class = call.get("caller_class")
-                obj_expr = call.get("object_expression")
-                method_called = call.get("method_called")
+                    self.graph.add_edge(
+                        cls_name,
+                        extends,
+                        relation="EXTENDS"
+                    )
 
-                if not caller_class:
+                for iface in implements:
+
+                    self.graph.add_node(
+                        iface,
+                        type="INTERFACE"
+                    )
+
+                    self.graph.add_edge(
+                        cls_name,
+                        iface,
+                        relation="IMPLEMENTS"
+                    )
+
+            # ----------------------------------------------------
+            # Fields / dependencies
+            # ----------------------------------------------------
+
+            for field in symbols.get(
+                "fields",
+                []
+            ):
+
+                enclosing = field.get(
+                    "enclosing_class"
+                )
+
+                field_name = field.get(
+                    "name"
+                )
+
+                field_type = field.get(
+                    "type"
+                )
+
+                if not enclosing or not field_name:
                     continue
 
-                target_class = None
-                if obj_expr and (caller_class, obj_expr) in field_type_map:
-                    target_class = field_type_map[(caller_class, obj_expr)]
-                elif obj_expr and obj_expr in class_type_map:
-                    target_class = obj_expr
+                field_type_map[
+                    (enclosing, field_name)
+                ] = field_type
 
-                if target_class:
-                    target_method_id = f"{target_class}.{method_called}()"
-                    self.graph.add_node(target_method_id, type="METHOD")
-                    self.graph.add_edge(caller_class, target_method_id, relation="CALLS")
-                else:
-                    unresolved_id = f"{obj_expr}.{method_called}()" if obj_expr else method_called
-                    self.graph.add_node(unresolved_id, type="METHOD_CALL")
-                    self.graph.add_edge(caller_class, unresolved_id, relation="CALLS")
+                annotations = field.get(
+                    "annotations",
+                    []
+                )
 
-    def build_graph_from_chunks(self, chunks: List[Dict[str, Any]]):
-        """Adapter allowing method chunks created by CodeChunker to populate the graph directly."""
+                is_injected = any(
+                    any(
+                        keyword in str(annotation)
+                        for keyword in [
+                            "@Autowired",
+                            "@Inject",
+                            "@Resource"
+                        ]
+                    )
+                    for annotation in annotations
+                )
+
+                if is_injected:
+
+                    self.graph.add_node(
+                        field_type,
+                        type="CLASS"
+                    )
+
+                    self.graph.add_edge(
+                        enclosing,
+                        field_type,
+                        relation="INJECTS",
+                        field_name=field_name,
+                        annotations=json.dumps(
+                            annotations
+                        )
+                    )
+
+        # --------------------------------------------------------
+        # Phase 2: Methods
+        # --------------------------------------------------------
+
+        for file_path, symbols in extracted_data:
+
+            file_str = (
+                file_path.name
+                if isinstance(file_path, Path)
+                else str(file_path)
+            )
+
+            for method in symbols.get(
+                "methods",
+                []
+            ):
+
+                method_name = method.get(
+                    "name",
+                    "unknown"
+                )
+
+                enclosing = method.get(
+                    "enclosing_class",
+                    "Global"
+                )
+
+                method_id = (
+                    f"{enclosing}.{method_name}()"
+                )
+
+                self.graph.add_node(
+                    method_id,
+                    type="METHOD",
+                    name=method_name,
+                    class_name=enclosing,
+                    file=file_str,
+                    annotations=json.dumps(
+                        method.get(
+                            "annotations",
+                            []
+                        )
+                    ),
+                    code_content=method.get(
+                        "source_code",
+                        ""
+                    ),
+                    start_line=method.get(
+                        "start_line",
+                        1
+                    ),
+                    end_line=method.get(
+                        "end_line",
+                        1
+                    )
+                )
+
+                self.graph.add_edge(
+                    enclosing,
+                    method_id,
+                    relation="HAS_METHOD"
+                )
+
+        # --------------------------------------------------------
+        # Phase 3: Resolve method calls
+        # --------------------------------------------------------
+
+        for file_path, symbols in extracted_data:
+
+            for method in symbols.get(
+                "methods",
+                []
+            ):
+
+                caller_class = method.get(
+                    "enclosing_class",
+                    "Global"
+                )
+
+                caller_method = method.get(
+                    "name",
+                    "unknown"
+                )
+
+                caller_id = (
+                    f"{caller_class}.{caller_method}()"
+                )
+
+                calls = method.get(
+                    "calls",
+                    []
+                )
+
+                if not calls:
+                    continue
+
+                for called_method in calls:
+
+                    called_method = str(
+                        called_method
+                    ).strip()
+
+                    if not called_method:
+                        continue
+
+                    # ------------------------------------------------
+                    # Find every method named like the called method
+                    # ------------------------------------------------
+
+                    targets = []
+
+                    for node, attrs in self.graph.nodes(
+                        data=True
+                    ):
+
+                        if attrs.get(
+                            "type"
+                        ) != "METHOD":
+                            continue
+
+                        node_method_name = attrs.get(
+                            "name"
+                        )
+
+                        if (
+                            node_method_name
+                            and
+                            node_method_name.lower()
+                            == called_method.lower()
+                        ):
+
+                            targets.append(node)
+
+                    # ------------------------------------------------
+                    # Connect to matching real methods
+                    # ------------------------------------------------
+
+                    if targets:
+
+                        for target in targets:
+
+                            self.graph.add_edge(
+                                caller_id,
+                                target,
+                                relation="CALLS"
+                            )
+
+                    else:
+
+                        # ------------------------------------------------
+                        # Keep unresolved call in graph
+                        # ------------------------------------------------
+
+                        unresolved_id = (
+                            f"{called_method}()"
+                        )
+
+                        self.graph.add_node(
+                            unresolved_id,
+                            type="METHOD_CALL",
+                            name=called_method
+                        )
+
+                        self.graph.add_edge(
+                            caller_id,
+                            unresolved_id,
+                            relation="CALLS"
+                        )
+
+    # ============================================================
+    # BUILD GRAPH FROM CHUNKS
+    # ============================================================
+
+    def build_graph_from_chunks(
+        self,
+        chunks: List[Dict[str, Any]]
+    ):
+
         self.graph.clear()
+
         repo_node = "CodeRepository"
-        self.graph.add_node(repo_node, type="REPOSITORY")
+
+        self.graph.add_node(
+            repo_node,
+            type="REPOSITORY"
+        )
+
+        # --------------------------------------------------------
+        # Phase 1: Create classes and methods
+        # --------------------------------------------------------
 
         for chunk in chunks:
-            file_name = chunk.get("file_name", chunk.get("file", "unknown"))
-            class_name = chunk.get("class_name", "Global")
-            method_name = chunk.get("method_name", "unknown")
 
-            self.graph.add_node(class_name, type="CLASS", file=file_name)
-            self.graph.add_edge(repo_node, class_name, relation="CONTAINS")
-
-            method_id = f"{class_name}.{method_name}()"
-            self.graph.add_node(
-                method_id, 
-                type="METHOD", 
-                file=file_name, 
-                line_start=chunk.get("start_line", 1), 
-                line_end=chunk.get("end_line", 1)
+            file_name = chunk.get(
+                "file_name",
+                chunk.get(
+                    "file",
+                    "unknown"
+                )
             )
-            self.graph.add_edge(class_name, method_id, relation="HAS_METHOD")
 
-            for call in chunk.get("calls", []):
-                call_id = f"{call}()" if not call.endswith("()") else call
-                self.graph.add_node(call_id, type="METHOD")
-                self.graph.add_edge(method_id, call_id, relation="CALLS")
+            class_name = chunk.get(
+                "class_name",
+                "Global"
+            )
 
-    def search_graph(self, query: str, top_k: int = 5, vector_store=None) -> List[Dict[str, Any]]:
-        """
-        Traverses the NetworkX knowledge graph starting from query symbols to locate relevant chunks.
-        Uses camelCase tokenization for fuzzy matching and vector store fallbacks for seed nodes.
-        """
-        raw_words = set(re.findall(r'[A-Za-z0-9]+', query))
-        query_tokens = {w.lower() for w in raw_words if len(w) > 2}
+            method_name = chunk.get(
+                "method_name",
+                "unknown"
+            )
 
-        seed_nodes = set()
+            self.graph.add_node(
+                class_name,
+                type="CLASS",
+                file=file_name
+            )
 
-        # 1. Broad symbol and sub-token matching across nodes
-        for node in self.graph.nodes():
-            node_str = str(node)
-            # Split camelCase node names into individual tokens (e.g., FastDateFormat -> fast, date, format)
-            split_words = set(re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\b)|[0-9]+', node_str))
-            node_tokens = {w.lower() for w in split_words if len(w) > 1}
-            
-            # Check for direct sub-token intersections or exact substring matches
-            if query_tokens.intersection(node_tokens) or any(qt in node_str.lower() for qt in query_tokens):
-                seed_nodes.add(node)
+            self.graph.add_edge(
+                repo_node,
+                class_name,
+                relation="CONTAINS"
+            )
 
-        # 2. VectorStore fallback if graph exact matching misses seed nodes
-        if len(seed_nodes) < 3 and vector_store and hasattr(vector_store, "search"):
-            raw_vec = vector_store.search(query, top_k=5)
-            for item in raw_vec:
-                chunk = item[0] if isinstance(item, tuple) else item
-                cls = chunk.get("class_name")
-                mth = chunk.get("method_name")
-                if cls and self.graph.has_node(cls):
-                    seed_nodes.add(cls)
-                if cls and mth:
-                    m_id = f"{cls}.{mth}()"
-                    if self.graph.has_node(m_id):
-                        seed_nodes.add(m_id)
+            method_id = (
+                f"{class_name}.{method_name}()"
+            )
 
-        # 3. Graph traversal from seeds to 1-hop neighborhood
-        visited = set()
-        matched_chunks = []
+            self.graph.add_node(
+                method_id,
+                type="METHOD",
+                name=method_name,
+                class_name=class_name,
+                file=file_name,
+                code_content=chunk.get(
+                    "code_content",
+                    ""
+                ),
+                start_line=chunk.get(
+                    "start_line",
+                    1
+                ),
+                end_line=chunk.get(
+                    "end_line",
+                    1
+                ),
+                annotations=chunk.get(
+                    "annotations",
+                    []
+                )
+            )
 
-        for seed in seed_nodes:
-            if seed in visited:
+            self.graph.add_edge(
+                class_name,
+                method_id,
+                relation="HAS_METHOD"
+            )
+
+        # --------------------------------------------------------
+        # Phase 2: Create CALLS edges
+        # --------------------------------------------------------
+
+        for chunk in chunks:
+
+            class_name = chunk.get(
+                "class_name",
+                "Global"
+            )
+
+            method_name = chunk.get(
+                "method_name",
+                "unknown"
+            )
+
+            caller_id = (
+                f"{class_name}.{method_name}()"
+            )
+
+            calls = chunk.get(
+                "calls",
+                []
+            )
+
+            # Compatibility with old chunks
+            if not calls:
+
+                calls = chunk.get(
+                    "relationships",
+                    []
+                )
+
+            if not calls:
                 continue
-            visited.add(seed)
 
-            node_attrs = self.graph.nodes[seed]
-            chunk_dict = {
-                "id": seed,
-                "class_name": seed if node_attrs.get("type") == "CLASS" else str(seed).split(".")[0],
-                "method_name": node_attrs.get("name", str(seed).split(".")[-1].replace("()", "")),
-                "file_name": node_attrs.get("file", ""),
-                "node_type": node_attrs.get("type", "UNKNOWN")
-            }
-            matched_chunks.append(chunk_dict)
+            for called_method in calls:
 
-            # Traversal across outgoing relationships (methods, implementations)
-            for neighbor in self.graph.successors(seed):
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    n_attrs = self.graph.nodes[neighbor]
-                    matched_chunks.append({
-                        "id": neighbor,
-                        "class_name": neighbor if n_attrs.get("type") == "CLASS" else str(neighbor).split(".")[0],
-                        "method_name": n_attrs.get("name", str(neighbor).split(".")[-1].replace("()", "")),
-                        "file_name": n_attrs.get("file", ""),
-                        "node_type": n_attrs.get("type", "UNKNOWN")
-                    })
+                called_method = str(
+                    called_method
+                ).strip()
 
-        return matched_chunks[:top_k]
+                if not called_method:
+                    continue
 
-    def get_calls_from(self, method_name: str) -> List[str]:
-        target = method_name if method_name.endswith("()") else f"{method_name}()"
-        if not self.graph.has_node(target):
-            target = method_name
-        if not self.graph.has_node(target):
-            return []
-        return [
-            dst for _, dst, data in self.graph.out_edges(target, data=True) 
-            if data.get("relation") == "CALLS"
-        ]
+                # Remove ()
+                clean_name = (
+                    called_method
+                    .replace("()", "")
+                    .strip()
+                )
 
-    def get_callers_of(self, method_name: str) -> List[str]:
-        target = method_name if method_name.endswith("()") else f"{method_name}()"
-        if not self.graph.has_node(target):
-            target = method_name
-        if not self.graph.has_node(target):
-            return []
-        return [
-            src for src, _, data in self.graph.in_edges(target, data=True) 
-            if data.get("relation") == "CALLS"
-        ]
+                # ------------------------------------------------
+                # Find actual method nodes
+                # ------------------------------------------------
+
+                targets = []
+
+                for node, attrs in self.graph.nodes(
+                    data=True
+                ):
+
+                    if attrs.get(
+                        "type"
+                    ) != "METHOD":
+                        continue
+
+                    node_method_name = attrs.get(
+                        "name"
+                    )
+
+                    if (
+                        node_method_name
+                        and
+                        node_method_name.lower()
+                        == clean_name.lower()
+                    ):
+
+                        targets.append(node)
+
+                # ------------------------------------------------
+                # Create CALLS relationship
+                # ------------------------------------------------
+
+                if targets:
+
+                    for target in targets:
+
+                        if target != caller_id:
+
+                            self.graph.add_edge(
+                                caller_id,
+                                target,
+                                relation="CALLS"
+                            )
+
+                else:
+
+                    # ------------------------------------------------
+                    # Unresolved method call
+                    # ------------------------------------------------
+
+                    unresolved_id = (
+                        f"{clean_name}()"
+                    )
+
+                    self.graph.add_node(
+                        unresolved_id,
+                        type="METHOD_CALL",
+                        name=clean_name
+                    )
+
+                    self.graph.add_edge(
+                        caller_id,
+                        unresolved_id,
+                        relation="CALLS"
+                    )
+
+    # ============================================================
+    # CALLERS
+    # ============================================================
+
+    def get_callers_of(
+        self,
+        method_name: str
+    ) -> List[str]:
+
+        target = (
+            method_name
+            if method_name.endswith("()")
+            else f"{method_name}()"
+        )
+
+        # Exact match
+        if self.graph.has_node(target):
+
+            return [
+                src
+                for src, _, data
+                in self.graph.in_edges(
+                    target,
+                    data=True
+                )
+                if data.get(
+                    "relation"
+                ) == "CALLS"
+            ]
+
+        # --------------------------------------------------------
+        # Fuzzy match by method name
+        # --------------------------------------------------------
+
+        target_name = (
+            method_name
+            .replace("()", "")
+            .lower()
+        )
+
+        results = []
+
+        for node, attrs in self.graph.nodes(
+            data=True
+        ):
+
+            if attrs.get(
+                "type"
+            ) != "METHOD":
+                continue
+
+            node_name = attrs.get(
+                "name",
+                ""
+            )
+
+            if (
+                node_name.lower()
+                == target_name
+            ):
+
+                for src, _, data in self.graph.in_edges(
+                    node,
+                    data=True
+                ):
+
+                    if data.get(
+                        "relation"
+                    ) == "CALLS":
+
+                        results.append(src)
+
+        return list(
+            dict.fromkeys(results)
+        )
+
+    # ============================================================
+    # CALLEES
+    # ============================================================
+
+    def get_calls_from(
+        self,
+        method_name: str
+    ) -> List[str]:
+
+        target = (
+            method_name
+            if method_name.endswith("()")
+            else f"{method_name}()"
+        )
+
+        if self.graph.has_node(target):
+
+            return [
+                dst
+                for _, dst, data
+                in self.graph.out_edges(
+                    target,
+                    data=True
+                )
+                if data.get(
+                    "relation"
+                ) == "CALLS"
+            ]
+
+        return []
+
+    # ============================================================
+    # SUMMARY
+    # ============================================================
 
     def get_summary(self) -> dict:
+
         return {
-            "total_nodes": self.graph.number_of_nodes(),
-            "total_edges": self.graph.number_of_edges(),
-            "node_types": self._count_node_types(),
-            "relationship_types": self._count_edge_relations()
+            "total_nodes":
+                self.graph.number_of_nodes(),
+
+            "total_edges":
+                self.graph.number_of_edges(),
+
+            "node_types":
+                self._count_node_types(),
+
+            "relationship_types":
+                self._count_edge_relations()
         }
 
-    def _count_node_types(self) -> dict:
+    # ============================================================
+    # NODE COUNTS
+    # ============================================================
+
+    def _count_node_types(
+        self
+    ) -> dict:
+
         counts = {}
-        for _, attrs in self.graph.nodes(data=True):
-            ntype = attrs.get("type", "UNKNOWN")
-            counts[ntype] = counts.get(ntype, 0) + 1
+
+        for _, attrs in self.graph.nodes(
+            data=True
+        ):
+
+            node_type = attrs.get(
+                "type",
+                "UNKNOWN"
+            )
+
+            counts[node_type] = (
+                counts.get(
+                    node_type,
+                    0
+                ) + 1
+            )
+
         return counts
 
-    def _count_edge_relations(self) -> dict:
+    # ============================================================
+    # EDGE COUNTS
+    # ============================================================
+
+    def _count_edge_relations(
+        self
+    ) -> dict:
+
         counts = {}
-        for _, _, attrs in self.graph.edges(data=True):
-            rel = attrs.get("relation", "UNKNOWN")
-            counts[rel] = counts.get(rel, 0) + 1
+
+        for _, _, attrs in self.graph.edges(
+            data=True
+        ):
+
+            relation = attrs.get(
+                "relation",
+                "UNKNOWN"
+            )
+
+            counts[relation] = (
+                counts.get(
+                    relation,
+                    0
+                ) + 1
+            )
+
         return counts
 
-    def export_graphml(self, output_path: str = "workspace/code_graph.graphml"):
-        out_file = Path(output_path)
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-        nx.write_graphml(self.graph, out_file)
-        print(f"[Graph] Exported GraphML to: {out_file.resolve()}")
+    # ============================================================
+    # CLASS METHODS
+    # ============================================================
 
-    def get_class_methods(self, class_name: str) -> List[str]:
-        if not self.graph.has_node(class_name):
+    def get_class_methods(
+        self,
+        class_name: str
+    ) -> List[str]:
+
+        if not self.graph.has_node(
+            class_name
+        ):
             return []
+
         return [
-            dst for _, dst, data in self.graph.out_edges(class_name, data=True)
-            if data.get("relation") == "HAS_METHOD"
+            dst
+            for _, dst, data
+            in self.graph.out_edges(
+                class_name,
+                data=True
+            )
+            if data.get(
+                "relation"
+            ) == "HAS_METHOD"
         ]
 
-    def get_class_containing(self, method_name: str) -> List[str]:
+    # ============================================================
+    # CLASS CONTAINING METHOD
+    # ============================================================
+
+    def get_class_containing(
+        self,
+        method_name: str
+    ) -> List[str]:
+
         results = []
-        for src, dst, data in self.graph.edges(data=True):
-            if data.get("relation") == "HAS_METHOD":
+
+        for src, dst, data in self.graph.edges(
+            data=True
+        ):
+
+            if data.get(
+                "relation"
+            ) == "HAS_METHOD":
+
                 if method_name in dst:
+
                     results.append(src)
-        return list(set(results))
 
-    def inspect_class_dependencies(self, class_name: str) -> dict:
+        return list(
+            set(results)
+        )
+
+    # ============================================================
+    # CLASS DEPENDENCIES
+    # ============================================================
+
+    def inspect_class_dependencies(
+        self,
+        class_name: str
+    ) -> dict:
+
         if class_name not in self.graph:
-            return {"error": f"Class '{class_name}' not in graph."}
 
-        relations = {"HAS_METHOD": [], "INJECTS": [], "CALLS": [], "EXTENDS": [], "IMPLEMENTS": []}
-        for successor in self.graph.successors(class_name):
-            edge_data = self.graph.get_edge_data(class_name, successor)
-            rel = edge_data.get("relation") if edge_data else None
-            if rel in relations:
-                relations[rel].append(successor)
+            return {
+                "error":
+                    f"Class '{class_name}' not in graph."
+            }
 
-        return {"class": class_name, "relationships": relations}
+        relations = {
+            "HAS_METHOD": [],
+            "INJECTS": [],
+            "CALLS": [],
+            "EXTENDS": [],
+            "IMPLEMENTS": []
+        }
+
+        for successor in self.graph.successors(
+            class_name
+        ):
+
+            edge_data = self.graph.get_edge_data(
+                class_name,
+                successor
+            )
+
+            relation = (
+                edge_data.get("relation")
+                if edge_data
+                else None
+            )
+
+            if relation in relations:
+
+                relations[
+                    relation
+                ].append(
+                    successor
+                )
+
+        return {
+            "class": class_name,
+            "relationships": relations
+        }
+
+    # ============================================================
+    # EXPORT GRAPH
+    # ============================================================
+
+    def export_graphml(
+        self,
+        output_path: str =
+            "workspace/code_graph.graphml"
+    ):
+
+        out_file = Path(
+            output_path
+        )
+
+        out_file.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        nx.write_graphml(
+            self.graph,
+            out_file
+        )
+
+        print(
+            f"[Graph] Exported GraphML to: "
+            f"{out_file.resolve()}"
+        )

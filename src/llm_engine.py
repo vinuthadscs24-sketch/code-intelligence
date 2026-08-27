@@ -1,279 +1,655 @@
-from pathlib import Path
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uvicorn
+from typing import Any, Dict, List, Optional
+import re
 
-
-from src.parser import JavaASTParser
-from src.chunker import CodeChunker
 from src.vector_store import VectorStore
 from src.graph_builder import CodeKnowledgeGraph
-from src.git_intelligence import GitIntelligence
+from src.hybrid_retriever import HybridRetriever
 from src.context_builder import CodeIntelligenceContextBuilder
 
-from src.impact_analysis import ImpactAnalyzer
 
+class CodeIntelligenceEngine:
+    """
+    Main intelligence layer for the AI Codebase Intelligence system.
 
-app = FastAPI(
-    title="AI Codebase Intelligence",
-    version="1.0"
-)
+    Responsibilities:
+        1. Hybrid code retrieval
+        2. Graph-aware context enrichment
+        3. Git/context integration
+        4. Deterministic contextual answers
+        5. Caller/callee and impact-aware queries
+    """
 
-vector_store = VectorStore()
-kg = CodeKnowledgeGraph()
-repo_dir = None
-engine = None
+    def __init__(
+        self,
+        repo_path: str,
+        vector_store: VectorStore,
+        graph_db: CodeKnowledgeGraph,
+        context_builder: Optional[CodeIntelligenceContextBuilder] = None,
+    ):
+        self.repo_path = str(repo_path)
+        self.vector_store = vector_store
+        self.graph_db = graph_db
+        self.context_builder = context_builder
 
+        self.retriever = HybridRetriever(
+            vector_store=self.vector_store,
+            knowledge_graph=self.graph_db,
+        )
 
-class IndexRequest(BaseModel):
-    repo_url: str
+    # ---------------------------------------------------------------
+    # Query
+    # ---------------------------------------------------------------
 
+    def answer_query(
+        self,
+        query: str,
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
 
-class QueryRequest(BaseModel):
-    query: str
-    top_k: int = 3
+        if not query or not query.strip():
+            return {
+                "query": query,
+                "retrieved_chunks": [],
+                "answer": "Please provide a valid codebase query.",
+            }
 
+        query = query.strip()
 
-@app.post("/index")
-def index_repo(req: IndexRequest):
-    global repo_dir, engine, kg, vector_store
+        # -----------------------------------------------------------
+        # 1. Detect graph-specific caller query
+        # -----------------------------------------------------------
 
-    # Resolve repository
-    if req.repo_url in [".", "./"]:
-        repo_path = Path(".").resolve()
-    else:
-        repo_path, _ = clone_repo_if_url(req.repo_url)
+        caller_target = self._extract_caller_target(query)
 
-    repo_dir = repo_path
+        if caller_target:
+            return self._answer_caller_query(
+                query=query,
+                method_name=caller_target,
+                top_k=top_k,
+            )
 
-    print(f"[Index] Repository: {repo_path}")
+        # -----------------------------------------------------------
+        # 2. Detect graph-specific callee query
+        # -----------------------------------------------------------
 
-    # Reset graph for a fresh repository
-    kg = CodeKnowledgeGraph()
+        callee_target = self._extract_callee_target(query)
 
-    parser = JavaASTParser()
-    extracted = []
+        if callee_target:
+            return self._answer_callee_query(
+                query=query,
+                method_name=callee_target,
+                top_k=top_k,
+            )
 
-    EXCLUDE_DIRS = {
-        ".git",
-        ".venv",
-        "venv",
-        "__pycache__",
-        "node_modules",
-        "target",
-        "build",
-        ".idea",
-    }
+        # -----------------------------------------------------------
+        # 3. Normal hybrid retrieval
+        # -----------------------------------------------------------
 
-    # Parse Java files
-    for java_file in repo_path.rglob("*.java"):
+        retrieved_chunks = self.retriever.search(
+            query=query,
+            top_k=top_k,
+        )
 
-        if any(
-            part in EXCLUDE_DIRS
-            for part in java_file.parts
-        ):
-            continue
+        # -----------------------------------------------------------
+        # 4. Build contextual answer
+        # -----------------------------------------------------------
 
-        if java_file.name in {
-            "module-info.java",
-            "package-info.java",
-        }:
-            continue
+        answer = self._build_contextual_answer(
+            query=query,
+            chunks=retrieved_chunks,
+        )
 
-        try:
-            result = parser.parse_file(str(java_file))
+        return {
+            "query": query,
+            "retrieved_chunks": retrieved_chunks,
+            "answer": answer,
+        }
 
-            if not result:
-                continue
+    # ---------------------------------------------------------------
+    # Caller Query
+    # ---------------------------------------------------------------
 
-            if isinstance(result, dict):
-                extracted.append(
-                    (Path(java_file), result)
+    def _answer_caller_query(
+        self,
+        query: str,
+        method_name: str,
+        top_k: int,
+    ) -> Dict[str, Any]:
+
+        callers = self.graph_db.get_callers_of(
+            method_name
+        )
+
+        # Try alternate method forms if exact lookup fails
+        if not callers:
+            callers = self._find_callers_fuzzy(
+                method_name
+            )
+
+        retrieved_chunks = []
+
+        # -----------------------------------------------------------
+        # Build useful graph results
+        # -----------------------------------------------------------
+
+        for caller in callers[:top_k]:
+
+            class_name, caller_method = (
+                self._split_method_id(caller)
+            )
+
+            retrieved_chunks.append({
+                "chunk_id": caller,
+                "chunk_type": "METHOD",
+                "class_name": class_name,
+                "method_name": caller_method,
+                "file_name": self._get_node_file(caller),
+                "graph_callers": [],
+                "graph_callees": self.graph_db.get_calls_from(
+                    caller
+                ),
+                "sources": ["graph"],
+                "graph_rank": len(retrieved_chunks) + 1,
+                "final_rank": len(retrieved_chunks) + 1,
+            })
+
+        # -----------------------------------------------------------
+        # Construct answer
+        # -----------------------------------------------------------
+
+        if not callers:
+            answer = (
+                f"No methods calling '{method_name}' "
+                f"were found in the code graph."
+            )
+
+        else:
+            lines = [
+                f"Methods that call '{method_name}()':"
+            ]
+
+            for caller in callers[:top_k]:
+                lines.append(
+                    f"- {caller}"
                 )
 
-            elif isinstance(result, (tuple, list)):
-                tree = result[0]
-                source_code = (
-                    result[1]
-                    if len(result) > 1
-                    else ""
+            answer = "\n".join(lines)
+
+        return {
+            "query": query,
+            "retrieved_chunks": retrieved_chunks,
+            "answer": answer,
+        }
+
+    # ---------------------------------------------------------------
+    # Callee Query
+    # ---------------------------------------------------------------
+
+    def _answer_callee_query(
+        self,
+        query: str,
+        method_name: str,
+        top_k: int,
+    ) -> Dict[str, Any]:
+
+        callees = self.graph_db.get_calls_from(
+            method_name
+        )
+
+        if not callees:
+            callees = self._find_callees_fuzzy(
+                method_name
+            )
+
+        retrieved_chunks = []
+
+        for callee in callees[:top_k]:
+
+            class_name, callee_method = (
+                self._split_method_id(callee)
+            )
+
+            retrieved_chunks.append({
+                "chunk_id": callee,
+                "chunk_type": "METHOD",
+                "class_name": class_name,
+                "method_name": callee_method,
+                "file_name": self._get_node_file(callee),
+                "graph_callers": self.graph_db.get_callers_of(
+                    callee
+                ),
+                "graph_callees": [],
+                "sources": ["graph"],
+                "graph_rank": len(retrieved_chunks) + 1,
+                "final_rank": len(retrieved_chunks) + 1,
+            })
+
+        if not callees:
+            answer = (
+                f"No methods called by '{method_name}()' "
+                f"were found in the code graph."
+            )
+
+        else:
+            lines = [
+                f"Methods called by '{method_name}()':"
+            ]
+
+            for callee in callees[:top_k]:
+                lines.append(
+                    f"- {callee}"
                 )
 
-                symbols = parser.extract_symbols_and_relations(
-                    tree,
-                    source_code
+            answer = "\n".join(lines)
+
+        return {
+            "query": query,
+            "retrieved_chunks": retrieved_chunks,
+            "answer": answer,
+        }
+
+    # ---------------------------------------------------------------
+    # Query Detection
+    # ---------------------------------------------------------------
+
+    @staticmethod
+    def _extract_caller_target(
+        query: str,
+    ) -> Optional[str]:
+
+        patterns = [
+            r"which\s+(?:methods?|functions?|classes?)\s+call\s+([A-Za-z_$][\w$]*)",
+            r"who\s+calls\s+([A-Za-z_$][\w$]*)",
+            r"what\s+calls\s+([A-Za-z_$][\w$]*)",
+            r"callers?\s+of\s+([A-Za-z_$][\w$]*)",
+        ]
+
+        query_lower = query.lower()
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                query_lower,
+            )
+
+            if match:
+                return match.group(1)
+
+        return None
+
+    @staticmethod
+    def _extract_callee_target(
+        query: str,
+    ) -> Optional[str]:
+
+        patterns = [
+            r"which\s+(?:methods?|functions?)\s+does\s+([A-Za-z_$][\w$]*)\s+call",
+            r"what\s+does\s+([A-Za-z_$][\w$]*)\s+call",
+            r"callees?\s+of\s+([A-Za-z_$][\w$]*)",
+        ]
+
+        query_lower = query.lower()
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                query_lower,
+            )
+
+            if match:
+                return match.group(1)
+
+        return None
+
+    # ---------------------------------------------------------------
+    # Fuzzy Caller Search
+    # ---------------------------------------------------------------
+
+    def _find_callers_fuzzy(
+        self,
+        method_name: str,
+    ) -> List[str]:
+
+        results = []
+
+        target = method_name.lower()
+
+        for node in self.graph_db.graph.nodes():
+
+            node_str = str(node)
+
+            if (
+                node_str.lower() == target
+                or node_str.lower().endswith(
+                    f".{target}()"
+                )
+            ):
+
+                callers = self.graph_db.get_callers_of(
+                    node_str
                 )
 
-                extracted.append(
-                    (
-                        Path(java_file),
-                        {
-                            "tree": tree,
-                            "source_code": source_code,
-                            "symbols": symbols,
-                        },
+                results.extend(callers)
+
+        return list(dict.fromkeys(results))
+
+    # ---------------------------------------------------------------
+    # Fuzzy Callee Search
+    # ---------------------------------------------------------------
+
+    def _find_callees_fuzzy(
+        self,
+        method_name: str,
+    ) -> List[str]:
+
+        results = []
+
+        target = method_name.lower()
+
+        for node in self.graph_db.graph.nodes():
+
+            node_str = str(node)
+
+            if (
+                node_str.lower() == target
+                or node_str.lower().endswith(
+                    f".{target}()"
+                )
+            ):
+
+                results.extend(
+                    self.graph_db.get_calls_from(
+                        node_str
                     )
                 )
 
-        except Exception as e:
-            print(
-                f"[Warning] Failed to parse {java_file}: {e}"
+        return list(dict.fromkeys(results))
+
+    # ---------------------------------------------------------------
+    # Graph Helpers
+    # ---------------------------------------------------------------
+
+    def _get_node_file(
+        self,
+        node_id: str,
+    ) -> str:
+
+        if self.graph_db.graph.has_node(node_id):
+
+            return self.graph_db.graph.nodes[
+                node_id
+            ].get("file", "")
+
+        return ""
+
+    @staticmethod
+    def _split_method_id(
+        method_id: str,
+    ) -> tuple:
+
+        clean = method_id.replace(
+            "()",
+            "",
+        )
+
+        if "." in clean:
+
+            class_name, method_name = (
+                clean.rsplit(".", 1)
             )
 
-    if not extracted:
-        raise HTTPException(
-            status_code=400,
-            detail="No Java files could be parsed."
+            return class_name, method_name
+
+        return "", clean
+
+    # ---------------------------------------------------------------
+    # Normal Contextual Answer
+    # ---------------------------------------------------------------
+
+    def _build_contextual_answer(
+        self,
+        query: str,
+        chunks: List[Dict[str, Any]],
+    ) -> str:
+
+        if not chunks:
+            return (
+                "No relevant code was found in the indexed repository."
+            )
+
+        lines = []
+
+        lines.append(
+            f'Based on the indexed codebase, the most relevant code '
+            f'for the query "{query}" is:'
         )
 
-    print(
-        f"[Index] Parsed {len(extracted)} Java files."
-    )
+        for index, chunk in enumerate(
+            chunks,
+            start=1,
+        ):
 
-    # Create chunks
-    chunker = CodeChunker(parser=parser)
+            file_name = (
+                chunk.get("file_name")
+                or chunk.get("file_path")
+                or "Unknown file"
+            )
 
-    chunks = chunker.create_chunks(
-        extracted
-    )
+            class_name = chunk.get(
+                "class_name",
+                "",
+            )
 
-    print(
-        f"[Index] Created {len(chunks)} chunks."
-    )
+            method_name = chunk.get(
+                "method_name",
+                "",
+            )
 
-    if not chunks:
-        raise HTTPException(
-            status_code=400,
-            detail="No code chunks were created."
+            chunk_type = chunk.get(
+                "chunk_type",
+                "METHOD",
+            )
+
+            callers = chunk.get(
+                "graph_callers",
+                [],
+            )
+
+            callees = chunk.get(
+                "graph_callees",
+                [],
+            )
+
+            lines.append("")
+
+            lines.append(
+                f"{index}. {file_name}"
+            )
+
+            if class_name:
+                lines.append(
+                    f"   Class: {class_name}"
+                )
+
+            if method_name:
+                lines.append(
+                    f"   Method: {method_name}"
+                )
+
+            lines.append(
+                f"   Type: {chunk_type}"
+            )
+
+            if callers:
+                lines.append(
+                    "   Callers: "
+                    + ", ".join(
+                        map(str, callers)
+                    )
+                )
+
+            if callees:
+                lines.append(
+                    "   Callees: "
+                    + ", ".join(
+                        map(str, callees)
+                    )
+                )
+
+            code = (
+                chunk.get("code_content")
+                or chunk.get("text_representation")
+                or ""
+            )
+
+            if code:
+
+                code_preview = code.strip()
+
+                if len(code_preview) > 500:
+
+                    code_preview = (
+                        code_preview[:500]
+                        + "..."
+                    )
+
+                lines.append(
+                    "   Code:\n"
+                    + self._indent_code(
+                        code_preview
+                    )
+                )
+
+        return "\n".join(lines)
+
+    # ---------------------------------------------------------------
+    # Utility
+    # ---------------------------------------------------------------
+
+    @staticmethod
+    def _indent_code(
+        code: str,
+    ) -> str:
+
+        return "\n".join(
+            "      " + line
+            for line in code.splitlines()
         )
 
-    # Build Knowledge Graph
-    kg.build_graph_from_chunks(chunks)
+    # ---------------------------------------------------------------
+    # Impact Analysis
+    # ---------------------------------------------------------------
 
-    summary = kg.get_summary()
+    def get_impact(
+        self,
+        method_name: str,
+    ) -> Dict[str, Any]:
 
-    print(
-        f"[Index] Graph: "
-        f"{summary['total_nodes']} nodes, "
-        f"{summary['total_edges']} edges."
-    )
+        if not method_name:
 
-    # Build FAISS index
-    vector_store = VectorStore()
-    vector_store.build_index(chunks)
+            return {
+                "error": "Method name cannot be empty."
+            }
 
-    print("[Index] FAISS index ready.")
+        from src.impact_analysis import ImpactAnalyzer
 
-    # Git Intelligence
-    git_intel = GitIntelligence(
-        repo_path=str(repo_path)
-    )
-
-    # Context Builder
-    context_builder = CodeIntelligenceContextBuilder(
-        git_intel=git_intel
-    )
-
-    # Full Intelligence Engine
-    engine = CodeIntelligenceEngine(
-        repo_path=str(repo_path),
-        vector_store=vector_store,
-        graph_db=kg,
-        context_builder=context_builder,
-    )
-
-    app.state.git_intel = git_intel
-    app.state.engine = engine
-
-    return {
-        "status": "ready",
-        "chunks_indexed": len(chunks),
-        "graph_nodes": summary["total_nodes"],
-        "graph_edges": summary["total_edges"],
-    }
-
-
-@app.post("/query")
-def query_engine(req: QueryRequest):
-
-    if engine is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Please index a repository first using /index."
+        analyzer = ImpactAnalyzer(
+            self.graph_db
         )
 
-    if not req.query.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Query cannot be empty."
+        return analyzer.analyze_blast_radius(
+            method_name
         )
 
-    try:
-        result = engine.answer_query(
-            query=req.query,
-            top_k=req.top_k,
+    # ---------------------------------------------------------------
+    # Git History
+    # ---------------------------------------------------------------
+
+    def get_file_history(
+        self,
+        file_path: str,
+    ) -> Any:
+
+        if self.context_builder is None:
+
+            return {
+                "error": (
+                    "Git context builder is not initialized."
+                )
+            }
+
+        git_intel = getattr(
+            self.context_builder,
+            "git_intel",
+            None,
         )
 
-        return result
+        if git_intel is None:
 
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Query failed: {str(e)}"
-        )
+            return {
+                "error": (
+                    "Git intelligence is not available."
+                )
+            }
 
-
-@app.get("/impact/{method_name:path}")
-def get_impact(method_name: str):
-
-    if kg is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Please index a repository first."
-        )
-
-    analyzer = ImpactAnalyzer(kg)
-
-    result = analyzer.analyze_blast_radius(
-        method_name
-    )
-
-    if "error" in result:
-        raise HTTPException(
-            status_code=404,
-            detail=result["error"]
-        )
-
-    return result
-
-
-@app.get("/history/{file_path:path}")
-def get_file_history(file_path: str):
-
-    if not hasattr(
-        app.state,
-        "git_intel"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Please index a repository first."
-        )
-
-    try:
-        return app.state.git_intel.get_file_history(
+        return git_intel.get_file_history(
             file_path
         )
 
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Git history error: {str(e)}"
-        )
+    # ---------------------------------------------------------------
+    # Why Changed / Provenance
+    # ---------------------------------------------------------------
 
+    def explain_why_changed(
+        self,
+        file_path: str,
+        method_name: str,
+        start_line: int,
+        end_line: int,
+    ) -> Dict[str, Any]:
 
-if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000
-    )
+        if self.context_builder is None:
+
+            return {
+                "answer": (
+                    "Git context builder is not initialized."
+                )
+            }
+
+        if hasattr(
+            self.context_builder,
+            "explain_why_changed",
+        ):
+
+            try:
+
+                return (
+                    self.context_builder
+                    .explain_why_changed(
+                        file_path=file_path,
+                        method_name=method_name,
+                        start_line=start_line,
+                        end_line=end_line,
+                    )
+                )
+
+            except Exception as e:
+
+                return {
+                    "answer": (
+                        f"Unable to perform provenance "
+                        f"analysis: {e}"
+                    )
+                }
+
+        return {
+            "answer": (
+                f"Provenance analysis requested for "
+                f"{method_name} in {file_path}, "
+                f"lines {start_line}-{end_line}, "
+                f"but the current context builder does not "
+                f"implement explain_why_changed()."
+            )
+        }
