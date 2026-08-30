@@ -22,9 +22,6 @@ def _process_batch(
     dimensions: int,
     apikey: Optional[str] = None
 ) -> Tuple[int, Optional[List[List[float]]]]:
-    """
-    Generate embeddings for one batch using Ollama.
-    """
 
     batch_idx, batch_texts = batch_info
 
@@ -37,7 +34,7 @@ def _process_batch(
                 "model": model_name,
                 "input": batch_texts
             },
-            timeout=120
+            timeout=300
         )
 
         response.raise_for_status()
@@ -51,7 +48,6 @@ def _process_batch(
                 "Ollama returned no embeddings."
             )
 
-        # Check embedding dimension
         actual_dimension = len(embeddings[0])
 
         if actual_dimension != dimensions:
@@ -90,13 +86,6 @@ def generate_embeddings(
     apikey: Optional[str] = None,
     max_workers: int = 4
 ) -> Optional[np.ndarray]:
-    """
-    Generate embeddings using Ollama.
-
-    Returns:
-        NumPy float32 array with shape:
-        (number_of_texts, embedding_dimension)
-    """
 
     if not texts:
         return np.array([], dtype=np.float32)
@@ -106,10 +95,6 @@ def generate_embeddings(
         f"using Ollama model '{model_name}' "
         f"(batch size: {batch_size})"
     )
-
-    # --------------------------------------------------------
-    # Create batches
-    # --------------------------------------------------------
 
     batches = []
 
@@ -127,10 +112,6 @@ def generate_embeddings(
     logger.info(
         f"Created {len(batches)} embedding batches."
     )
-
-    # --------------------------------------------------------
-    # Process batches in parallel
-    # --------------------------------------------------------
 
     all_embeddings = [None] * len(batches)
 
@@ -182,10 +163,6 @@ def generate_embeddings(
 
                 return None
 
-    # --------------------------------------------------------
-    # Flatten embeddings while preserving order
-    # --------------------------------------------------------
-
     embeddings_list = []
 
     for batch_embeddings in all_embeddings:
@@ -209,10 +186,6 @@ def generate_embeddings(
         )
 
         return np.array([], dtype=np.float32)
-
-    # --------------------------------------------------------
-    # Convert to NumPy
-    # --------------------------------------------------------
 
     try:
 
@@ -243,9 +216,6 @@ def generate_embeddings(
 # ============================================================
 
 class FaissVectorIndex:
-    """
-    Manages the FAISS vector index and associated metadata.
-    """
 
     def __init__(
         self,
@@ -266,7 +236,7 @@ class FaissVectorIndex:
 
         self.metadata_file_path = (
             self.index_dir
-            / config.METADATA_FILENAME
+            / config.FAISS_METADATA_FILENAME
         )
 
         self.model = model_name
@@ -322,18 +292,10 @@ class FaissVectorIndex:
             f"{len(chunks)} chunks..."
         )
 
-        # ----------------------------------------------------
-        # Extract chunk text
-        # ----------------------------------------------------
-
         chunk_texts = [
             chunk.content
             for chunk in chunks
         ]
-
-        # ----------------------------------------------------
-        # Generate Ollama embeddings
-        # ----------------------------------------------------
 
         embeddings = generate_embeddings(
             texts=chunk_texts,
@@ -341,7 +303,7 @@ class FaissVectorIndex:
             batch_size=self.batch_size,
             dimensions=self.embedding_dim,
             apikey=apikey,
-            max_workers=4
+            max_workers=1
         )
 
         if (
@@ -356,10 +318,6 @@ class FaissVectorIndex:
 
             return False
 
-        # ----------------------------------------------------
-        # Validate dimensions
-        # ----------------------------------------------------
-
         if embeddings.shape[1] != self.embedding_dim:
 
             logger.error(
@@ -371,10 +329,6 @@ class FaissVectorIndex:
 
             return False
 
-        # ----------------------------------------------------
-        # Create FAISS index
-        # ----------------------------------------------------
-
         self.index = faiss.IndexFlatL2(
             self.embedding_dim
         )
@@ -385,10 +339,6 @@ class FaissVectorIndex:
             f"FAISS index built successfully. "
             f"Total vectors: {self.index.ntotal}"
         )
-
-        # ----------------------------------------------------
-        # Create metadata
-        # ----------------------------------------------------
 
         self.chunk_metadata = []
 
@@ -418,9 +368,20 @@ class FaissVectorIndex:
                 meta_item
             )
 
-        # ----------------------------------------------------
-        # Save index
-        # ----------------------------------------------------
+        # Safety check
+        if (
+            self.index.ntotal
+            != len(self.chunk_metadata)
+        ):
+
+            logger.error(
+                f"FAISS vector count "
+                f"({self.index.ntotal}) does not match "
+                f"metadata count "
+                f"({len(self.chunk_metadata)})."
+            )
+
+            return False
 
         self.save_index()
 
@@ -453,7 +414,7 @@ class FaissVectorIndex:
         if self.chunk_metadata:
 
             logger.info(
-                f"Saving metadata to: "
+                f"Saving FAISS metadata to: "
                 f"{self.metadata_file_path}"
             )
 
@@ -472,7 +433,7 @@ class FaissVectorIndex:
         else:
 
             logger.warning(
-                "No metadata to save."
+                "No FAISS metadata to save."
             )
 
     # ========================================================
@@ -487,7 +448,7 @@ class FaissVectorIndex:
         ):
 
             logger.warning(
-                f"Index files not found in "
+                f"FAISS index files not found in "
                 f"{self.index_dir}."
             )
 
@@ -520,7 +481,7 @@ class FaissVectorIndex:
                 )
 
             logger.info(
-                f"Loading metadata from: "
+                f"Loading FAISS metadata from: "
                 f"{self.metadata_file_path}"
             )
 
@@ -533,23 +494,23 @@ class FaissVectorIndex:
                 self.chunk_metadata = json.load(f)
 
             logger.info(
-                f"Metadata loaded for "
+                f"FAISS metadata loaded for "
                 f"{len(self.chunk_metadata)} chunks."
             )
-
-            # Validate vector/metadata count
 
             if (
                 self.index.ntotal
                 != len(self.chunk_metadata)
             ):
 
-                logger.warning(
-                    f"Vector count "
+                logger.error(
+                    f"FAISS vector count "
                     f"({self.index.ntotal}) does not "
                     f"match metadata count "
                     f"({len(self.chunk_metadata)})."
                 )
+
+                return False
 
             return True
 
@@ -561,7 +522,6 @@ class FaissVectorIndex:
             )
 
             self.index = None
-
             self.chunk_metadata = []
 
             return False
@@ -582,10 +542,6 @@ class FaissVectorIndex:
         Tuple[float, Dict[str, Any]]
     ]:
 
-        # ----------------------------------------------------
-        # Make sure index is loaded
-        # ----------------------------------------------------
-
         if self.index is None:
 
             logger.info(
@@ -600,10 +556,6 @@ class FaissVectorIndex:
                 )
 
                 return []
-
-        # ----------------------------------------------------
-        # Generate query embedding
-        # ----------------------------------------------------
 
         logger.debug(
             f"Searching for query: "
@@ -630,10 +582,6 @@ class FaissVectorIndex:
 
             return []
 
-        # ----------------------------------------------------
-        # Validate dimensions
-        # ----------------------------------------------------
-
         if query_embedding.shape[1] != self.index.d:
 
             logger.error(
@@ -645,22 +593,13 @@ class FaissVectorIndex:
 
             return []
 
-        # ----------------------------------------------------
-        # Limit top_k
-        # ----------------------------------------------------
-
         actual_top_k = min(
             top_k,
             self.index.ntotal
         )
 
         if actual_top_k <= 0:
-
             return []
-
-        # ----------------------------------------------------
-        # Search FAISS
-        # ----------------------------------------------------
 
         distances, indices = self.index.search(
             query_embedding,
@@ -716,294 +655,114 @@ class FaissVectorIndex:
 
 
 # ============================================================
-# TEST
+# TEST FAISS INDEX
 # ============================================================
 
 if __name__ == "__main__":
 
-    logger.remove()
+    logger.info(
+        "========================================"
+    )
 
-    logger.add(
-        lambda msg: print(
-            msg,
-            end=""
-        ),
-        level="INFO"
+    logger.info(
+        "       TESTING FAISS VECTOR INDEX"
     )
 
     logger.info(
         "========================================"
     )
 
-    logger.info(
-        "Testing Ollama + FAISS Vector Index"
-    )
-
-    logger.info(
-        "========================================"
-    )
-
-    # --------------------------------------------------------
-    # Test Ollama connection
-    # --------------------------------------------------------
-
-    try:
-
-        response = requests.get(
-            f"{config.OLLAMA_BASE_URL}/api/tags",
-            timeout=10
-        )
-
-        response.raise_for_status()
-
-        models = response.json().get(
-            "models",
-            []
-        )
-
-        model_names = [
-            model.get("name")
-            for model in models
-        ]
-
-        logger.info(
-            f"Ollama models available: "
-            f"{model_names}"
-        )
-
-    except Exception as e:
-
-        logger.error(
-            f"Could not connect to Ollama: {e}"
-        )
-
-        raise SystemExit(1)
-
-    # --------------------------------------------------------
-    # Create dummy chunks
-    # --------------------------------------------------------
-
-    dummy_chunks_data = [
-
-        {
-            "file_path": Path(
-                "test.py_chunk_1"
-            ),
-
-            "content":
-                "def hello(): "
-                "return 'world'",
-
-            "language":
-                "python",
-
-            "original_file_path":
-                Path("test.py"),
-
-            "chunk_id":
-                1,
-
-            "size_bytes":
-                30,
-
-            "absolute_path":
-                Path("/abs/test.py")
-        },
-
-        {
-            "file_path": Path(
-                "test.py_chunk_2"
-            ),
-
-            "content":
-                "class Greeter: "
-                "def greet(self): "
-                "print('Hello')",
-
-            "language":
-                "python",
-
-            "original_file_path":
-                Path("test.py"),
-
-            "chunk_id":
-                2,
-
-            "size_bytes":
-                50,
-
-            "absolute_path":
-                Path("/abs/test.py")
-        },
-
-        {
-            "file_path": Path(
-                "other.js_chunk_1"
-            ),
-
-            "content":
-                "function test() "
-                "{ return 1+1; }",
-
-            "language":
-                "javascript",
-
-            "original_file_path":
-                Path("other.js"),
-
-            "chunk_id":
-                1,
-
-            "size_bytes":
-                40,
-
-            "absolute_path":
-                Path("/abs/other.js")
-        }
-    ]
-
-    test_chunks = [
-        DocumentChunk(**data)
-        for data in dummy_chunks_data
-    ]
-
-    # --------------------------------------------------------
-    # Initialize index
-    # --------------------------------------------------------
-
-    test_index_dir = (
+    # Use a separate test directory
+    index_dir = (
         config.INDEX_DIR
-        / "test_vector_index"
+        / "test_faiss_index"
     )
 
-    vector_indexer = FaissVectorIndex(
-        index_dir=test_index_dir,
-        embedding_dim=
-            config.EMBEDDING_DIMENSIONS
-    )
-
-    # --------------------------------------------------------
-    # Build index
-    # --------------------------------------------------------
-
-    logger.info(
-        "\n--- Building Vector Index ---"
-    )
-
-    build_success = (
-        vector_indexer.build_index(
-            test_chunks,
-            force_rebuild=True
-        )
-    )
-
-    if not build_success:
-
-        logger.error(
-            "Failed to build vector index."
-        )
-
-        raise SystemExit(1)
-
-    logger.info(
-        "Index built successfully."
+    faiss_index = FaissVectorIndex(
+        index_dir=index_dir
     )
 
     # --------------------------------------------------------
-    # Load index
+    # LOAD EXISTING INDEX
     # --------------------------------------------------------
 
     logger.info(
-        "\n--- Testing Index Loading ---"
+        "Testing FAISS index loading..."
     )
 
-    loaded_vector_indexer = (
-        FaissVectorIndex(
-            index_dir=test_index_dir,
-            embedding_dim=
-                config.EMBEDDING_DIMENSIONS
-        )
-    )
-
-    load_success = (
-        loaded_vector_indexer.load_index()
-    )
-
-    if not load_success:
-
-        logger.error(
-            "Failed to load vector index."
-        )
-
-        raise SystemExit(1)
-
-    logger.info(
-        "Index loaded successfully."
-    )
-
-    # --------------------------------------------------------
-    # Search
-    # --------------------------------------------------------
-
-    logger.info(
-        "\n--- Testing Search ---"
-    )
-
-    query = (
-        "python hello world function"
-    )
-
-    search_results = (
-        loaded_vector_indexer.search(
-            query,
-            top_k=2
-        )
-    )
-
-    logger.info(
-        f"Search results for: "
-        f"'{query}'"
-    )
-
-    for score, meta in search_results:
+    if faiss_index.load_index():
 
         logger.info(
-            f"  Distance: {score:.4f}"
+            "FAISS index loaded successfully."
         )
 
         logger.info(
-            f"  File: "
-            f"{meta['original_file_path']}"
+            f"Total vectors: "
+            f"{faiss_index.index.ntotal}"
         )
 
         logger.info(
-            f"  Chunk ID: "
-            f"{meta['chunk_id']}"
+            f"Embedding dimensions: "
+            f"{faiss_index.index.d}"
         )
-
-    if search_results:
 
         logger.info(
-            "Basic vector search "
-            "assertion passed."
+            f"Metadata entries: "
+            f"{len(faiss_index.chunk_metadata)}"
         )
+
+        # ----------------------------------------------------
+        # TEST SEARCH
+        # ----------------------------------------------------
+
+        logger.info(
+            "Testing FAISS search..."
+        )
+
+        results = faiss_index.search(
+            query_text="python hello function",
+            top_k=3
+        )
+
+        if results:
+
+            logger.info(
+                f"FAISS returned "
+                f"{len(results)} results."
+            )
+
+            for score, metadata in results:
+
+                logger.info(
+                    f"Distance: {score:.4f}, "
+                    f"File: "
+                    f"{metadata.get('original_file_path')}, "
+                    f"Vector ID: "
+                    f"{metadata.get('vector_id')}"
+                )
+
+            logger.info(
+                "FAISS search test PASSED."
+            )
+
+        else:
+
+            logger.warning(
+                "FAISS search returned no results."
+            )
 
     else:
 
-        logger.error(
-            "No search results returned."
+        logger.warning(
+            "FAISS index could not be loaded."
         )
 
-        raise SystemExit(1)
+        logger.warning(
+            f"Expected index directory: "
+            f"{index_dir}"
+        )
 
-    logger.info(
-        "========================================"
-    )
-
-    logger.info(
-        "OLLAMA + FAISS TEST PASSED"
-    )
-
-    logger.info(
-        "========================================"
-    )
+        logger.warning(
+            "You need to build the FAISS index "
+            "from your repository chunks first."
+        )

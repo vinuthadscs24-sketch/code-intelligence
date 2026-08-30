@@ -53,13 +53,30 @@ state = EngineState()
 # --- Request/Response Models ---
 
 class IndexRequest(BaseModel):
-    repo_path_or_url: str = Field(..., example="https://github.com/spring-projects/spring-petclinic.git")
+    repo_path_or_url: Optional[str] = Field(None, example="https://github.com/spring-projects/spring-petclinic.git")
+    repo_url: Optional[str] = None
     rebuild_index: bool = Field(False, description="Force rebuilding FAISS vector index")
+
+    @property
+    def url(self) -> str:
+        target = self.repo_path_or_url or self.repo_url
+        if not target:
+            raise ValueError("Must provide either repo_path_or_url or repo_url.")
+        return target
 
 
 class QueryRequest(BaseModel):
-    question: str = Field(..., example="How does user authentication work in this codebase?")
+    question: Optional[str] = Field(None, example="How does user authentication work in this codebase?")
+    query: Optional[str] = None
     top_k: int = Field(5, ge=1, le=20)
+    repo_id: Optional[str] = "default"
+
+    @property
+    def text(self) -> str:
+        q = self.question or self.query
+        if not q:
+            raise ValueError("Must provide either question or query field.")
+        return q
 
 
 class ProvenanceRequest(BaseModel):
@@ -81,6 +98,7 @@ def health_check():
     }
 
 
+@app.post("/api/repository/index")
 @app.post("/index")
 def index_repository(payload: IndexRequest):
     """
@@ -88,11 +106,13 @@ def index_repository(payload: IndexRequest):
     the Knowledge Graph, and populates FAISS vector embeddings.
     """
     try:
+        target_url = payload.url
+        
         # Clean up existing temporary repository if active
         if state.is_temp and state.repo_path and state.repo_path.exists():
             shutil.rmtree(state.repo_path, ignore_errors=True)
 
-        repo_path, is_temp = clone_repo_if_url(payload.repo_path_or_url)
+        repo_path, is_temp = clone_repo_if_url(target_url)
         if not repo_path.exists() or not repo_path.is_dir():
             raise HTTPException(status_code=400, detail=f"Directory '{repo_path}' does not exist.")
 
@@ -160,16 +180,21 @@ def index_repository(payload: IndexRequest):
 
         summary = kg.get_summary()
         return {
+            "status": "success",
             "message": "Repository indexed successfully.",
+            "repoName": repo_path.name,
             "total_files": len(extracted_data),
             "total_chunks": len(chunks),
             "graph_summary": summary
         }
 
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Indexing failed: {str(e)}")
 
 
+@app.post("/api/query")
 @app.post("/ask")
 def query_codebase(payload: QueryRequest):
     """
@@ -180,13 +205,16 @@ def query_codebase(payload: QueryRequest):
         raise HTTPException(status_code=400, detail="No repository indexed. Call POST /index first.")
 
     try:
-        response = state.engine.answer_query(payload.question, top_k=payload.top_k)
+        q_text = payload.text
+        response = state.engine.answer_query(q_text, top_k=payload.top_k)
         return {
-            "query": payload.question,
+            "query": q_text,
             "answer": response.get("answer", "No response generated."),
             "retrieved_chunks": response.get("retrieved_chunks", []),
             "context_used": response.get("context", {})
         }
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 

@@ -121,7 +121,7 @@ class RAGPipeline:
         # Indexes are specific to this repo_id, stored in self.index_dir
         vector_index_file = self.index_dir / config.FAISS_INDEX_FILENAME
         bm25_index_file = self.index_dir / config.BM25_INDEX_FILENAME
-        metadata_file = self.index_dir / config.METADATA_FILENAME
+        metadata_file = self.index_dir / config.FAISS_METADATA_FILENAME
 
         if not force_reindex and vector_index_file.exists() and bm25_index_file.exists() and metadata_file.exists():
             logger.info(f"Indexes already exist for repo_id '{self.repo_id}' at {self.index_dir}. Skipping indexing.")

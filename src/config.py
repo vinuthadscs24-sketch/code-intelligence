@@ -34,6 +34,7 @@ else:
 # ============================================================
 
 CONFIG_FILE_PATH = PROJECT_ROOT / "config.yaml"
+
 APP_CONFIG: Dict[str, Any] = {}
 
 if CONFIG_FILE_PATH.exists():
@@ -42,7 +43,8 @@ if CONFIG_FILE_PATH.exists():
             APP_CONFIG = yaml.safe_load(f) or {}
 
         logger.info(
-            f"Loaded application configuration from: {CONFIG_FILE_PATH}"
+            f"Loaded application configuration from: "
+            f"{CONFIG_FILE_PATH}"
         )
 
     except Exception as e:
@@ -50,6 +52,7 @@ if CONFIG_FILE_PATH.exists():
             f"Error loading {CONFIG_FILE_PATH}: {e}. "
             "Using defaults and environment variables."
         )
+
 else:
     logger.info(
         f"Configuration file {CONFIG_FILE_PATH} not found. "
@@ -66,19 +69,13 @@ def get_config_value(
     default: Optional[Any] = None,
     env_var: Optional[str] = None
 ) -> Any:
-    """
-    Retrieves a configuration value in this priority:
-
-    1. Environment variable
-    2. config.yaml
-    3. Default value
-    """
 
     # --------------------------------------------------------
     # 1. Environment variable
     # --------------------------------------------------------
 
     if env_var:
+
         value = os.getenv(env_var)
 
         if value is not None:
@@ -104,6 +101,7 @@ def get_config_value(
     value = APP_CONFIG
 
     try:
+
         for key in keys:
             value = value[key]
 
@@ -111,6 +109,7 @@ def get_config_value(
             return value
 
     except (KeyError, TypeError):
+
         pass
 
     # --------------------------------------------------------
@@ -124,7 +123,6 @@ def get_config_value(
 # API KEYS & BASE URLS
 # ============================================================
 
-# Default API Key to "ollama" if omitted
 OPENAI_API_KEY = get_config_value(
     "api_keys.openai",
     "ollama",
@@ -136,7 +134,6 @@ GOOGLE_API_KEY = get_config_value(
     env_var="GOOGLE_API_KEY"
 )
 
-# Default OpenAI Base URL to local Ollama OpenAI-compatible endpoint
 OPENAI_BASE_URL = get_config_value(
     "url.openai",
     "http://localhost:11434/v1",
@@ -210,11 +207,30 @@ GRAMMAR_DIR = Path(
 # CREATE DIRECTORIES
 # ============================================================
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-REPOS_DIR.mkdir(parents=True, exist_ok=True)
-INDEX_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-GRAMMAR_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+REPOS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+INDEX_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+LOG_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+GRAMMAR_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
 
 
 # ============================================================
@@ -242,7 +258,8 @@ logger.add(
 )
 
 logger.info(
-    f"Logging configured. Level: {LOG_LEVEL}, "
+    f"Logging configured. "
+    f"Level: {LOG_LEVEL}, "
     f"File: {LOG_FILE_PATH}"
 )
 
@@ -314,7 +331,10 @@ constructs when relevant.
 # TREE-SITTER CONFIGURATION
 # ============================================================
 
-TREE_SITTER_LANGUAGES: Dict[str, Dict[str, Any]] = get_config_value(
+TREE_SITTER_LANGUAGES: Dict[
+    str,
+    Dict[str, Any]
+] = get_config_value(
     "tree_sitter.languages",
     {
         "python": {
@@ -374,19 +394,51 @@ TEXT_CHUNK_OVERLAP = get_config_value(
 # INDEXING CONFIGURATION
 # ============================================================
 
+# ------------------------------------------------------------
+# FAISS
+# ------------------------------------------------------------
+
 FAISS_INDEX_FILENAME = get_config_value(
     "indexing.faiss.filename",
     "vector_index.faiss"
 )
 
-METADATA_FILENAME = get_config_value(
+# IMPORTANT:
+# Your existing repository currently has:
+#
+# data/indexes/my-test-repo/
+#     vector_index.faiss
+#     metadata.json
+#
+# Therefore FAISS currently uses metadata.json.
+
+FAISS_METADATA_FILENAME = get_config_value(
     "indexing.faiss.metadata_filename",
     "metadata.json"
 )
 
+
+# ------------------------------------------------------------
+# BM25
+# ------------------------------------------------------------
+
 BM25_INDEX_FILENAME = get_config_value(
     "indexing.bm25.filename",
     "bm25_index.pkl"
+)
+
+# IMPORTANT:
+# Your existing repository currently has:
+#
+# data/indexes/my-test-repo/
+#     bm25_index.pkl
+#     metadata.json
+#
+# Therefore BM25 also currently uses metadata.json.
+
+BM25_METADATA_FILENAME = get_config_value(
+    "indexing.bm25.metadata_filename",
+    "metadata.json"
 )
 
 
@@ -442,7 +494,6 @@ DEFAULT_EXCLUDED_DIRS: List[str] = get_config_value(
     ]
 )
 
-
 DEFAULT_EXCLUDED_FILES: List[str] = get_config_value(
     "file_processing.default_excluded_files",
     [
@@ -454,7 +505,6 @@ DEFAULT_EXCLUDED_FILES: List[str] = get_config_value(
         "LICENSE"
     ]
 )
-
 
 MAX_FILE_SIZE_MB = get_config_value(
     "file_processing.max_file_size_mb",
@@ -496,37 +546,113 @@ def log_important_configs():
     logger.info("        CODE-AWARE RAG CONFIG")
     logger.info("========================================")
 
-    logger.info(f"Project Root: {PROJECT_ROOT}")
-    logger.info(f"Data Directory: {DATA_DIR}")
-    logger.info(f"Repository Directory: {REPOS_DIR}")
-    logger.info(f"Index Directory: {INDEX_DIR}")
-    logger.info(f"Embedding Provider: {EMBEDDING_MODEL_PROVIDER}")
-    logger.info(f"Embedding Model: {EMBEDDING_MODEL_NAME}")
-    logger.info(f"Embedding Dimensions: {EMBEDDING_DIMENSIONS}")
-    logger.info(f"Embedding Batch Size: {EMBEDDING_BATCH_SIZE}")
-    logger.info(f"Ollama URL: {OLLAMA_BASE_URL}")
-    logger.info(f"Generator Model: {GENERATOR_MODEL_NAME}")
-    logger.info(f"OpenAI Base URL: {OPENAI_BASE_URL}")
-    logger.info(f"Supported AST Languages: {list(TREE_SITTER_LANGUAGES.keys())}")
-    logger.info(f"API Server: http://{API_HOST}:{API_PORT}")
+    logger.info(
+        f"Project Root: {PROJECT_ROOT}"
+    )
+
+    logger.info(
+        f"Data Directory: {DATA_DIR}"
+    )
+
+    logger.info(
+        f"Repository Directory: {REPOS_DIR}"
+    )
+
+    logger.info(
+        f"Index Directory: {INDEX_DIR}"
+    )
+
+    logger.info(
+        f"Embedding Provider: "
+        f"{EMBEDDING_MODEL_PROVIDER}"
+    )
+
+    logger.info(
+        f"Embedding Model: "
+        f"{EMBEDDING_MODEL_NAME}"
+    )
+
+    logger.info(
+        f"Embedding Dimensions: "
+        f"{EMBEDDING_DIMENSIONS}"
+    )
+
+    logger.info(
+        f"Embedding Batch Size: "
+        f"{EMBEDDING_BATCH_SIZE}"
+    )
+
+    logger.info(
+        f"Ollama URL: "
+        f"{OLLAMA_BASE_URL}"
+    )
+
+    logger.info(
+        f"Generator Model: "
+        f"{GENERATOR_MODEL_NAME}"
+    )
+
+    logger.info(
+        f"OpenAI Base URL: "
+        f"{OPENAI_BASE_URL}"
+    )
+
+    logger.info(
+        f"FAISS Index File: "
+        f"{FAISS_INDEX_FILENAME}"
+    )
+
+    logger.info(
+        f"FAISS Metadata File: "
+        f"{FAISS_METADATA_FILENAME}"
+    )
+
+    logger.info(
+        f"BM25 Index File: "
+        f"{BM25_INDEX_FILENAME}"
+    )
+
+    logger.info(
+        f"BM25 Metadata File: "
+        f"{BM25_METADATA_FILENAME}"
+    )
+
+    logger.info(
+        f"Supported AST Languages: "
+        f"{list(TREE_SITTER_LANGUAGES.keys())}"
+    )
+
+    logger.info(
+        f"API Server: "
+        f"http://{API_HOST}:{API_PORT}"
+    )
+
     logger.info("========================================")
 
 
 # ============================================================
-# OPENAI LLM CLIENT (ROUTED TO LOCAL OLLAMA BY DEFAULT)
+# OPENAI LLM CLIENT
 # ============================================================
 
 def get_openai_llm_client(
     apikey: Optional[str] = None,
     baseurl: Optional[str] = None
 ):
-    """
-    Creates an AsyncOpenAI client routed to local Ollama.
-    """
-    key = apikey or OPENAI_API_KEY or "ollama"
-    url = baseurl or OPENAI_BASE_URL or "http://localhost:11434/v1"
+
+    key = (
+        apikey
+        or OPENAI_API_KEY
+        or "ollama"
+    )
+
+    url = (
+        baseurl
+        or OPENAI_BASE_URL
+        or "http://localhost:11434/v1"
+    )
 
     try:
+
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(
@@ -534,14 +660,29 @@ def get_openai_llm_client(
             base_url=url
         )
 
-        logger.info(f"AsyncOpenAI client initialized for base_url: {url}")
+        logger.info(
+            f"AsyncOpenAI client initialized "
+            f"for base_url: {url}"
+        )
+
         return client
 
     except ImportError:
-        logger.error("OpenAI package not installed. Run: pip install openai")
+
+        logger.error(
+            "OpenAI package not installed. "
+            "Run: pip install openai"
+        )
+
         raise
+
     except Exception as e:
-        logger.error(f"Failed to initialize AsyncOpenAI client: {e}")
+
+        logger.error(
+            f"Failed to initialize "
+            f"AsyncOpenAI client: {e}"
+        )
+
         raise
 
 
@@ -553,13 +694,21 @@ def get_openai_embeddings_client(
     apikey: Optional[str] = None,
     baseurl: Optional[str] = None
 ):
-    """
-    Creates an OpenAI client. Kept for backwards compatibility.
-    """
-    key = apikey or OPENAI_API_KEY or "ollama"
-    url = baseurl or OPENAI_BASE_URL or "http://localhost:11434/v1"
+
+    key = (
+        apikey
+        or OPENAI_API_KEY
+        or "ollama"
+    )
+
+    url = (
+        baseurl
+        or OPENAI_BASE_URL
+        or "http://localhost:11434/v1"
+    )
 
     try:
+
         from openai import OpenAI
 
         client = OpenAI(
@@ -567,14 +716,28 @@ def get_openai_embeddings_client(
             base_url=url
         )
 
-        logger.info("OpenAI embedding client initialized.")
+        logger.info(
+            "OpenAI embedding client initialized."
+        )
+
         return client
 
     except ImportError:
-        logger.error("OpenAI package not installed. Run: pip install openai")
+
+        logger.error(
+            "OpenAI package not installed. "
+            "Run: pip install openai"
+        )
+
         raise
+
     except Exception as e:
-        logger.error(f"Failed to initialize OpenAI client: {e}")
+
+        logger.error(
+            f"Failed to initialize "
+            f"OpenAI client: {e}"
+        )
+
         raise
 
 

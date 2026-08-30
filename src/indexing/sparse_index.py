@@ -1,316 +1,809 @@
 import pickle
-from pathlib import Path
 import json
+from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
 import numpy as np
 from loguru import logger
-from rank_bm25 import BM25Okapi # Using the Okapi BM25 variant
+from rank_bm25 import BM25Okapi
 
-# Import configurations and DocumentChunk model
 from src import config
-from src.data_processing.chunkers import DocumentChunk # Pydantic model for chunks
-
+from src.data_processing.chunkers import DocumentChunk
 from src.utils.nlp_utils import NLPUtils as nlp
+
+
+# ============================================================
+# BM25 PREPROCESSING
+# ============================================================
 
 def preprocess_text_for_bm25(text: str) -> List[str]:
     """
-    Enhanced preprocessing for BM25:
+    Preprocess text for BM25 retrieval.
+
+    Steps:
     - Remove extra spaces
-    - Stem the text
-    - Tokenize the text
-    - Remove stopwords
-    - Remove duplicates
-    - Generate trigrams
+    - Stem text
+    - Tokenize
+    - Keep word tokens
+    - Remove unwanted words
+    - Remove duplicate words
     """
+
     if not text:
         return []
-    
-    # 文本预处理
+
+    # Remove extra spaces
     text = nlp.removeExtraSpaces(text)
+
+    # Stem text
     text = nlp.stem(text)
-    
-    # 分词处理
+
+    # Tokenize
     tokens = nlp.tokenize(text, True)
-    word_tokens = [token for token in tokens if token['type'] == 'word']
-    token_values = [token['value'] for token in word_tokens]
-    
-    # 词汇清理
+
+    # Keep only word tokens
+    word_tokens = [
+        token
+        for token in tokens
+        if token["type"] == "word"
+    ]
+
+    # Remove stopwords/unwanted words
     cleaned_tokens = nlp.removeWords(word_tokens)
+
+    # Remove duplicate words
     unique_tokens = nlp.setOfWords(cleaned_tokens)
-    unique_values = [token['value'] for token in unique_tokens]
-    
-    # 生成Trigram
-    cleaned_text = ' '.join(unique_values)
-    trigrams = nlp.ngram(cleaned_text, 3)
 
-    if trigrams:
-        return [str(value) for value in trigrams]
+    # Extract token values
+    return [
+        str(token["value"])
+        for token in unique_tokens
+    ]
 
-    return [str(value) for value in unique_values]
 
+# ============================================================
+# BM25 INDEX
+# ============================================================
 
 class BM25Index:
     """
-    Manages the BM25 sparse index.
+    Manages the BM25 sparse retrieval index.
     """
+
     def __init__(self, index_dir: Path):
+
         self.index_dir = index_dir
-        self.bm25_model_file_path = self.index_dir / config.BM25_INDEX_FILENAME
-        # We also need to store the mapping from BM25's internal document ID
-        # back to our chunk metadata or a persistent chunk ID.
-        # For simplicity, we'll store the same metadata list as Faiss,
-        # assuming the order of chunks fed to BM25 is the same as for Faiss.
-        self.metadata_file_path = self.index_dir / config.METADATA_FILENAME # Reuse from vector_index for consistency
+
+        self.bm25_model_file_path = (
+            self.index_dir /
+            config.BM25_INDEX_FILENAME
+        )
+
+        self.metadata_file_path = (
+            self.index_dir /
+            config.BM25_METADATA_FILENAME
+        )
 
         self.bm25: Optional[BM25Okapi] = None
-        self.chunk_corpus_tokenized: List[List[str]] = [] # Stores tokenized version of each chunk's content
-        self.chunk_metadata: List[Dict[str, Any]] = [] # Stores metadata for each chunk
 
-        self.index_dir.mkdir(parents=True, exist_ok=True)
+        self.chunk_corpus_tokenized: List[List[str]] = []
 
-    def build_index(self, chunks: List[DocumentChunk], force_rebuild: bool = False) -> bool:
-        """
-        Builds or rebuilds the BM25 index from a list of DocumentChunks.
-        """
-        if not force_rebuild and self.bm25_model_file_path.exists() and self.metadata_file_path.exists():
-            logger.info(f"BM25 index already exists at {self.index_dir}. Skipping build. Use force_rebuild=True to override.")
+        self.chunk_metadata: List[Dict[str, Any]] = []
+
+        self.index_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+    # ========================================================
+    # BUILD INDEX
+    # ========================================================
+
+    def build_index(
+        self,
+        chunks: List[DocumentChunk],
+        force_rebuild: bool = False
+    ) -> bool:
+
+        if (
+            not force_rebuild
+            and self.bm25_model_file_path.exists()
+            and self.metadata_file_path.exists()
+        ):
+            logger.info(
+                f"BM25 index already exists at "
+                f"{self.index_dir}. "
+                f"Skipping build."
+            )
             return True
 
         if not chunks:
-            logger.warning("No chunks provided to build the BM25 index.")
+            logger.warning(
+                "No chunks provided to build BM25 index."
+            )
             return False
 
-        logger.info(f"Building BM25 index with {len(chunks)} chunks...")
+        logger.info(
+            f"Building BM25 index with "
+            f"{len(chunks)} chunks..."
+        )
 
-        self.chunk_corpus_tokenized = [preprocess_text_for_bm25(chunk.content) for chunk in chunks]
+        # ----------------------------------------------------
+        # Tokenize chunks
+        # ----------------------------------------------------
 
-        # Filter out empty tokenized documents, which can cause issues with BM25
-        valid_indices = [i for i, tokens in enumerate(self.chunk_corpus_tokenized) if tokens]
+        all_tokenized_chunks = [
+            preprocess_text_for_bm25(
+                chunk.content
+            )
+            for chunk in chunks
+        ]
+
+        # ----------------------------------------------------
+        # Remove empty documents
+        # ----------------------------------------------------
+
+        valid_indices = [
+            i
+            for i, tokens in enumerate(
+                all_tokenized_chunks
+            )
+            if tokens
+        ]
+
         if not valid_indices:
-            logger.warning("All chunks resulted in empty token lists after preprocessing. BM25 index cannot be built.")
+            logger.warning(
+                "All chunks became empty after preprocessing."
+            )
             return False
 
-        self.chunk_corpus_tokenized = [self.chunk_corpus_tokenized[i] for i in valid_indices]
+        self.chunk_corpus_tokenized = [
+            all_tokenized_chunks[i]
+            for i in valid_indices
+        ]
 
-        # Prepare metadata only for chunks that are actually indexed
+        # ----------------------------------------------------
+        # Metadata
+        # ----------------------------------------------------
+
         self.chunk_metadata = []
-        for i_original, chunk in enumerate(chunks):
-            if i_original not in valid_indices:
-                continue
-            meta_item = chunk.model_dump(exclude={'absolute_path'})
-            meta_item['original_file_path'] = str(chunk.original_file_path)
-            meta_item['file_path'] = str(chunk.file_path)
-            # The 'id' here corresponds to the index in self.chunk_corpus_tokenized and self.chunk_metadata
-            meta_item['bm25_doc_id'] = len(self.chunk_metadata)
-            self.chunk_metadata.append(meta_item)
 
-        if not self.chunk_corpus_tokenized: # Should be caught by valid_indices check, but as a safeguard
-            logger.error("No valid tokenized content to build BM25 index.")
+        for original_index in valid_indices:
+
+            chunk = chunks[original_index]
+
+            meta_item = chunk.model_dump(
+                exclude={"absolute_path"}
+            )
+
+            meta_item["original_file_path"] = str(
+                chunk.original_file_path
+            )
+
+            meta_item["file_path"] = str(
+                chunk.file_path
+            )
+
+            meta_item["bm25_doc_id"] = len(
+                self.chunk_metadata
+            )
+
+            self.chunk_metadata.append(
+                meta_item
+            )
+
+        # ----------------------------------------------------
+        # Safety check
+        # ----------------------------------------------------
+
+        if len(self.chunk_corpus_tokenized) != len(
+            self.chunk_metadata
+        ):
+            logger.error(
+                f"BM25 corpus count "
+                f"({len(self.chunk_corpus_tokenized)}) "
+                f"does not match metadata count "
+                f"({len(self.chunk_metadata)})."
+            )
             return False
+
+        # ----------------------------------------------------
+        # Build BM25
+        # ----------------------------------------------------
 
         try:
-            self.bm25 = BM25Okapi(self.chunk_corpus_tokenized)
-            logger.info(f"BM25 index built. Indexed {len(self.chunk_corpus_tokenized)} documents.")
+
+            self.bm25 = BM25Okapi(
+                self.chunk_corpus_tokenized
+            )
+
+            logger.info(
+                f"BM25 index built successfully. "
+                f"Indexed "
+                f"{len(self.chunk_corpus_tokenized)} "
+                f"documents."
+            )
+
         except Exception as e:
-            logger.error(f"Failed to initialize BM25Okapi model: {e}")
+
+            logger.error(
+                f"Failed to initialize BM25Okapi: {e}"
+            )
+
+            self.bm25 = None
             return False
 
         self.save_index()
+
         return True
 
+    # ========================================================
+    # SAVE INDEX
+    # ========================================================
+
     def save_index(self):
-        """Saves the BM25 model and associated metadata to disk."""
-        if self.bm25:
-            logger.info(f"Saving BM25 model to: {self.bm25_model_file_path}")
-            with open(self.bm25_model_file_path, 'wb') as f:
-                pickle.dump({
-                    "bm25_model": self.bm25,
-                    "corpus_tokenized_checksum": len(self.chunk_corpus_tokenized) # Simple checksum
-                }, f)
-        else:
-            logger.warning("No BM25 model to save.")
+
+        if self.bm25 is not None:
+
+            logger.info(
+                f"Saving BM25 model to: "
+                f"{self.bm25_model_file_path}"
+            )
+
+            with open(
+                self.bm25_model_file_path,
+                "wb"
+            ) as f:
+
+                pickle.dump(
+                    {
+                        "bm25_model": self.bm25,
+                        "corpus_tokenized_checksum":
+                            len(
+                                self.chunk_corpus_tokenized
+                            )
+                    },
+                    f
+                )
 
         if self.chunk_metadata:
-            logger.info(f"Saving BM25 metadata to: {self.metadata_file_path} (shared with vector index)")
-            # This assumes that the order and content of chunks for BM25 and Faiss are identical.
-            # If they can diverge, BM25 should have its own metadata file.
-            # For now, we assume they are built from the same chunk list.
-            with open(self.metadata_file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.chunk_metadata, f, indent=2)
-        else:
-            logger.warning("No BM25 metadata to save.")
 
+            logger.info(
+                f"Saving BM25 metadata to: "
+                f"{self.metadata_file_path}"
+            )
+
+            with open(
+                self.metadata_file_path,
+                "w",
+                encoding="utf-8"
+            ) as f:
+
+                json.dump(
+                    self.chunk_metadata,
+                    f,
+                    indent=2
+                )
+
+    # ========================================================
+    # LOAD INDEX
+    # ========================================================
 
     def load_index(self) -> bool:
-        """Loads the BM25 model and metadata from disk."""
-        if not self.bm25_model_file_path.exists() or not self.metadata_file_path.exists():
-            logger.warning(f"BM25 index or metadata files not found in {self.index_dir}. Cannot load index.")
+
+        if (
+            not self.bm25_model_file_path.exists()
+            or not self.metadata_file_path.exists()
+        ):
+            logger.warning(
+                f"BM25 index or metadata not found "
+                f"in {self.index_dir}."
+            )
             return False
 
         try:
-            logger.info(f"Loading BM25 model from: {self.bm25_model_file_path}")
-            with open(self.bm25_model_file_path, 'rb') as f:
-                saved_data = pickle.load(f)
-                self.bm25 = saved_data["bm25_model"]
 
-            logger.info(f"Loading BM25 metadata from: {self.metadata_file_path}")
-            with open(self.metadata_file_path, 'r', encoding='utf-8') as f:
+            logger.info(
+                f"Loading BM25 model from: "
+                f"{self.bm25_model_file_path}"
+            )
+
+            with open(
+                self.bm25_model_file_path,
+                "rb"
+            ) as f:
+
+                saved_data = pickle.load(f)
+
+            self.bm25 = saved_data.get(
+                "bm25_model"
+            )
+
+            if self.bm25 is None:
+                logger.error(
+                    "Saved BM25 file does not contain "
+                    "a valid BM25 model."
+                )
+                return False
+
+            logger.info(
+                f"Loading BM25 metadata from: "
+                f"{self.metadata_file_path}"
+            )
+
+            with open(
+                self.metadata_file_path,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
                 self.chunk_metadata = json.load(f)
 
-            # Rebuild the tokenized corpus if needed for some BM25 implementations,
-            # or ensure the loaded model doesn't strictly require it for get_scores.
-            # rank_bm25 typically doesn't need the corpus again after fitting for get_scores.
-            # However, it's good practice to ensure consistency.
-            # For now, we assume the pickled BM25 object is self-contained for scoring.
-            logger.info(f"BM25 index and metadata loaded. Model ready for {len(self.chunk_metadata)} documents.")
+            if not isinstance(
+                self.chunk_metadata,
+                list
+            ):
+                logger.error(
+                    "BM25 metadata is not a list."
+                )
 
-            # Sanity check (optional):
-            # if saved_data.get("corpus_tokenized_checksum") != len(self.chunk_metadata):
-            #    logger.warning("Mismatch between loaded BM25 model's expected corpus size and loaded metadata size.")
+                self.chunk_metadata = []
+                return False
+
+            expected_count = saved_data.get(
+                "corpus_tokenized_checksum"
+            )
+
+            actual_count = len(
+                self.chunk_metadata
+            )
+
+            if (
+                expected_count is not None
+                and expected_count != actual_count
+            ):
+                logger.error(
+                    f"BM25 model document count "
+                    f"({expected_count}) does not "
+                    f"match metadata count "
+                    f"({actual_count})."
+                )
+
+                self.bm25 = None
+                self.chunk_metadata = []
+
+                return False
+
+            logger.info(
+                f"BM25 index and metadata loaded. "
+                f"Model ready for "
+                f"{len(self.chunk_metadata)} documents."
+            )
 
             return True
-        except FileNotFoundError:
-            logger.error(f"BM25 model or metadata file not found during load.")
-            return False
+
         except Exception as e:
-            logger.error(f"Error loading BM25 index or metadata: {e}")
+
+            logger.error(
+                f"Error loading BM25 index: {e}"
+            )
+
             self.bm25 = None
             self.chunk_metadata = []
+
             return False
 
-    def search(self, query_text: str, top_k: int = config.RETRIEVAL_BM25_TOP_K) -> List[Tuple[float, Dict[str, Any]]]:
-        """
-        Searches the index for a query text using BM25.
+    # ========================================================
+    # SEARCH
+    # ========================================================
 
-        Args:
-            query_text (str): The text to search for.
-            top_k (int): The number of top results to return.
+    def search(
+        self,
+        query_text: str,
+        top_k: int = config.RETRIEVAL_BM25_TOP_K
+    ) -> List[
+        Tuple[
+            float,
+            Dict[str, Any]
+        ]
+    ]:
 
-        Returns:
-            List[Tuple[float, Dict[str, Any]]]: A list of (score, metadata) tuples.
-                                                Score is BM25 relevance score (higher is better).
-        """
+        if not query_text or not query_text.strip():
+
+            logger.warning(
+                "Empty BM25 search query."
+            )
+
+            return []
+
+        # Load index if necessary
         if self.bm25 is None:
-            logger.warning("BM25 Index not loaded or built. Cannot perform search.")
-            if not self.load_index(): # Try to load if not already
+
+            if not self.load_index():
+
+                logger.error(
+                    "Could not load BM25 index."
+                )
+
                 return []
 
-        if self.bm25 is None: # Check again after load attempt
-            logger.error("Failed to load BM25 index for search.")
+        if self.bm25 is None:
             return []
 
         if not self.chunk_metadata:
-            logger.error("BM25 metadata is empty. Cannot map search results.")
+            logger.error(
+                "BM25 metadata is empty."
+            )
             return []
 
-        logger.debug(f"BM25 searching for query: '{query_text[:50]}...' (top_k={top_k})")
-        tokenized_query = preprocess_text_for_bm25(query_text)
+        if top_k <= 0:
+            return []
+
+        # ----------------------------------------------------
+        # Preprocess query
+        # ----------------------------------------------------
+
+        tokenized_query = (
+            preprocess_text_for_bm25(
+                query_text
+            )
+        )
 
         if not tokenized_query:
-            logger.debug("Tokenized query is empty. BM25 search will likely return no results.")
             return []
+
+        # ----------------------------------------------------
+        # Calculate scores
+        # ----------------------------------------------------
 
         try:
-            # Get scores for all documents in the corpus
-            doc_scores = self.bm25.get_scores(tokenized_query)
+
+            doc_scores = self.bm25.get_scores(
+                tokenized_query
+            )
+
         except Exception as e:
-            logger.error(f"Error getting BM25 scores: {e}")
+
+            logger.error(
+                f"Error getting BM25 scores: {e}"
+            )
+
             return []
 
-        # Get top_k indices and scores
-        # Ensure we don't request more items than available documents.
-        actual_top_k = min(top_k, len(doc_scores))
-        if actual_top_k == 0:
+        # ----------------------------------------------------
+        # Top K
+        # ----------------------------------------------------
+
+        actual_top_k = min(
+            top_k,
+            len(doc_scores),
+            len(self.chunk_metadata)
+        )
+
+        if actual_top_k <= 0:
             return []
 
-        top_n_indices = np.argsort(doc_scores)[::-1][:actual_top_k] # Sort descending, take top_k
+        top_n_indices = (
+            np.argsort(doc_scores)[::-1]
+            [:actual_top_k]
+        )
+
+        # ----------------------------------------------------
+        # Build results
+        # ----------------------------------------------------
 
         results = []
-        for i in top_n_indices:
-            score = doc_scores[i]
-            # BM25 scores can be negative if a document has no query terms.
-            # We might want to filter out non-positive scores depending on strategy.
-            # For now, returning them as is.
-            if i < len(self.chunk_metadata):
-                results.append((float(score), self.chunk_metadata[i]))
-            else:
-                logger.warning(f"BM25 returned index {i} which is out of bounds for metadata ({len(self.chunk_metadata)}).")
 
-        logger.debug(f"BM25 search returned {len(results)} results.")
+        for index in top_n_indices:
+
+            index = int(index)
+
+            if (
+                index < 0
+                or index >= len(self.chunk_metadata)
+            ):
+                continue
+
+            score = float(
+                doc_scores[index]
+            )
+
+            metadata = (
+                self.chunk_metadata[index]
+            )
+
+            results.append(
+                (
+                    score,
+                    metadata
+                )
+            )
+
         return results
 
 
-# --- Example Usage ---
+# ============================================================
+# TEST
+# ============================================================
+
 if __name__ == "__main__":
-    from src.data_processing.chunkers import DocumentChunk # Re-import for clarity if running standalone
-    from pathlib import Path
 
     logger.remove()
-    logger.add(lambda msg: print(msg, end=""), level="INFO")
 
-    # Create dummy chunks for testing (same as vector_index example for consistency)
+    logger.add(
+        lambda message: print(
+            message,
+            end=""
+        ),
+        level="INFO"
+    )
+
+    # --------------------------------------------------------
+    # Dummy chunks
+    # --------------------------------------------------------
+
     dummy_chunks_data = [
-        {"file_path": Path("test.py_chunk_1"), "content": "def hello(): return 'world'", "language": "python", "original_file_path": Path("test.py"), "chunk_id":1, "size_bytes":30, "absolute_path": Path("/abs/test.py")},
-        {"file_path": Path("test.py_chunk_2"), "content": "class Greeter: def greet(self): print('Python Greeter class hello')", "language": "python", "original_file_path": Path("test.py"), "chunk_id":2, "size_bytes":50, "absolute_path": Path("/abs/test.py")},
-        {"file_path": Path("other.js_chunk_1"), "content": "function test() { return 1+1; } // javascript test function", "language": "javascript", "original_file_path": Path("other.js"), "chunk_id":1, "size_bytes":40, "absolute_path": Path("/abs/other.js")},
-        {"file_path": Path("empty_content.txt_chunk_1"), "content": "", "language": "text", "original_file_path": Path("empty_content.txt"), "chunk_id":1, "size_bytes":0, "absolute_path": Path("/abs/empty_content.txt")}, # Empty content
+
+        {
+            "file_path": Path(
+                "test.py_chunk_1"
+            ),
+
+            "content":
+                "def hello(): "
+                "return 'world'",
+
+            "language": "python",
+
+            "original_file_path":
+                Path("test.py"),
+
+            "chunk_id": 1,
+
+            "size_bytes": 30,
+
+            "absolute_path":
+                Path("/abs/test.py")
+        },
+
+        {
+            "file_path": Path(
+                "test.py_chunk_2"
+            ),
+
+            "content":
+                "class Greeter: "
+                "def greet(self): "
+                "print('Python Greeter "
+                "class hello')",
+
+            "language": "python",
+
+            "original_file_path":
+                Path("test.py"),
+
+            "chunk_id": 2,
+
+            "size_bytes": 50,
+
+            "absolute_path":
+                Path("/abs/test.py")
+        },
+
+        {
+            "file_path": Path(
+                "other.js_chunk_1"
+            ),
+
+            "content":
+                "function test() "
+                "{ return 1+1; } "
+                "// javascript test "
+                "function",
+
+            "language": "javascript",
+
+            "original_file_path":
+                Path("other.js"),
+
+            "chunk_id": 1,
+
+            "size_bytes": 40,
+
+            "absolute_path":
+                Path("/abs/other.js")
+        },
+
+        {
+            "file_path": Path(
+                "empty_content.txt_chunk_1"
+            ),
+
+            "content": "",
+
+            "language": "text",
+
+            "original_file_path":
+                Path("empty_content.txt"),
+
+            "chunk_id": 1,
+
+            "size_bytes": 0,
+
+            "absolute_path":
+                Path("/abs/empty_content.txt")
+        }
     ]
-    test_chunks = [DocumentChunk(**data) for data in dummy_chunks_data]
 
-    # Initialize BM25 Index
-    test_bm25_index_dir = config.INDEX_DIR / "test_bm25_index"
-    bm25_indexer = BM25Index(index_dir=test_bm25_index_dir)
+    # --------------------------------------------------------
+    # Create DocumentChunk objects
+    # --------------------------------------------------------
 
-    # Build index
-    logger.info("\n--- Building BM25 Index ---")
-    build_success = bm25_indexer.build_index(test_chunks, force_rebuild=True)
+    test_chunks = [
+        DocumentChunk(**data)
+        for data in dummy_chunks_data
+    ]
 
-    if build_success:
-        logger.info("BM25 Index built successfully.")
+    # --------------------------------------------------------
+    # Test directory
+    # --------------------------------------------------------
 
-        # Test loading the index
-        logger.info("\n--- Testing BM25 Index Loading ---")
-        loaded_bm25_indexer = BM25Index(index_dir=test_bm25_index_dir)
-        load_success = loaded_bm25_indexer.load_index()
+    test_bm25_index_dir = (
+        config.INDEX_DIR /
+        "test_bm25_index"
+    )
 
-        if load_success:
-            logger.info("BM25 Index loaded successfully.")
-            # Test search
-            logger.info("\n--- Testing BM25 Search ---")
+    bm25_indexer = BM25Index(
+        index_dir=test_bm25_index_dir
+    )
 
-            queries = [
-                "python hello function",
-                "javascript test",
-                "empty", # Should not match much if empty content was filtered
-                "Greeter class"
-            ]
+    # --------------------------------------------------------
+    # Build
+    # --------------------------------------------------------
 
-            for query in queries:
-                search_results = loaded_bm25_indexer.search(query, top_k=2)
-                logger.info(f"Search results for '{query}':")
-                if not search_results:
-                    logger.info("  No results found.")
-                for score, meta in search_results:
-                    logger.info(f"  Score (BM25): {score:.4f}, Chunk Original Path: {meta['original_file_path']}, Chunk ID: {meta['chunk_id']}")
-                logger.info("---")
+    logger.info(
+        "\n--- Building BM25 Index ---"
+    )
 
-            # A simple check
-            results_for_greeter = loaded_bm25_indexer.search("Greeter class", top_k=1)
-            if results_for_greeter:
-                assert "test.py_chunk_2" in str(results_for_greeter[0][1]['file_path']), "BM25 search result mismatch for 'Greeter class'"
-                logger.info("Basic BM25 search assertion passed.")
-            else:
-                logger.error("BM25 search for 'Greeter class' returned no results.")
+    build_success = (
+        bm25_indexer.build_index(
+            test_chunks,
+            force_rebuild=True
+        )
+    )
 
+    if not build_success:
+
+        logger.error(
+            "Failed to build BM25 index."
+        )
+
+        raise SystemExit(1)
+
+    logger.info(
+        "BM25 Index built successfully."
+    )
+
+    # --------------------------------------------------------
+    # Load
+    # --------------------------------------------------------
+
+    logger.info(
+        "\n--- Testing BM25 Index Loading ---"
+    )
+
+    loaded_bm25_indexer = BM25Index(
+        index_dir=test_bm25_index_dir
+    )
+
+    load_success = (
+        loaded_bm25_indexer.load_index()
+    )
+
+    if not load_success:
+
+        logger.error(
+            "Failed to load BM25 index."
+        )
+
+        raise SystemExit(1)
+
+    logger.info(
+        "BM25 Index loaded successfully."
+    )
+
+    # --------------------------------------------------------
+    # Search tests
+    # --------------------------------------------------------
+
+    logger.info(
+        "\n--- Testing BM25 Search ---"
+    )
+
+    queries = [
+        "python hello function",
+        "javascript test",
+        "empty",
+        "Greeter class"
+    ]
+
+    for query in queries:
+
+        search_results = (
+            loaded_bm25_indexer.search(
+                query,
+                top_k=2
+            )
+        )
+
+        logger.info(
+            f"Search results for '{query}':"
+        )
+
+        if not search_results:
+
+            logger.info(
+                "  No results found."
+            )
+
+        for score, metadata in search_results:
+
+            logger.info(
+                f"  Score (BM25): "
+                f"{score:.4f}, "
+                f"Chunk Original Path: "
+                f"{metadata['original_file_path']}, "
+                f"Chunk ID: "
+                f"{metadata['chunk_id']}"
+            )
+
+        logger.info("---")
+
+    # --------------------------------------------------------
+    # Greeter assertion
+    # --------------------------------------------------------
+
+    results_for_greeter = (
+        loaded_bm25_indexer.search(
+            "Greeter class",
+            top_k=1
+        )
+    )
+
+    if results_for_greeter:
+
+        top_result = results_for_greeter[0][1]
+
+        expected_path = "test.py_chunk_2"
+
+        actual_path = str(
+            top_result["file_path"]
+        )
+
+        if expected_path in actual_path:
+
+            logger.info(
+                "Basic BM25 search assertion passed."
+            )
 
         else:
-            logger.error("Failed to load the BM25 index for testing.")
-    else:
-        logger.error("Failed to build the BM25 index for testing.")
 
-    # Clean up test index directory (optional)
-    # import shutil
-    # if test_bm25_index_dir.exists():
-    #     shutil.rmtree(test_bm25_index_dir)
-    #     logger.info(f"Cleaned up test BM25 index directory: {test_bm25_index_dir}")
+            logger.warning(
+                "BM25 search returned a different "
+                "top result for 'Greeter class'."
+            )
+
+            logger.warning(
+                f"Expected: {expected_path}"
+            )
+
+            logger.warning(
+                f"Got: {actual_path}"
+            )
+
+    else:
+
+        logger.error(
+            "BM25 search for "
+            "'Greeter class' returned no results."
+        )
