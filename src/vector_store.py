@@ -3,6 +3,7 @@ import pickle
 import requests
 import faiss
 import numpy as np
+from typing import List, Dict, Any, Union
 
 
 class VectorStore:
@@ -11,78 +12,130 @@ class VectorStore:
 
     Ollama:
         http://localhost:11434
-        Model: nomic-embed-text
-        Dimension: 768
+
+    Model:
+        nomic-embed-text
+
+    Dimension:
+        768
     """
 
     def __init__(
         self,
-        model_name="nomic-embed-text",
-        ollama_url="http://localhost:11434",
+        model_name: str = "nomic-embed-text",
+        ollama_url: str = "http://localhost:11434",
     ):
         self.model_name = model_name
         self.ollama_url = ollama_url.rstrip("/")
 
-        self.embedding_url = f"{self.ollama_url}/api/embeddings"
+        self.embedding_url = (
+            f"{self.ollama_url}/api/embeddings"
+        )
 
-        # nomic-embed-text produces 768-dimensional embeddings
         self.dimension = 768
 
-        self.index = faiss.IndexFlatIP(self.dimension)
-        self.chunks = []
+        self.index = faiss.IndexFlatIP(
+            self.dimension
+        )
+
+        self.chunks: List[Dict[str, Any]] = []
 
         self._check_ollama()
 
+    # ============================================================
+    # OLLAMA
+    # ============================================================
+
     def _check_ollama(self):
-        """Check that Ollama is running and the embedding model is available."""
+        """Verify Ollama is running and the embedding model exists."""
+
         try:
             response = requests.get(
                 f"{self.ollama_url}/api/tags",
                 timeout=5,
             )
+
             response.raise_for_status()
 
-            models = response.json().get("models", [])
-            model_names = [m.get("name", "") for m in models]
+            models = response.json().get(
+                "models",
+                [],
+            )
 
-            if not any(
+            model_names = [
+                model.get("name", "")
+                for model in models
+            ]
+
+            model_available = any(
                 name == self.model_name
-                or name.startswith(f"{self.model_name}:")
+                or name.startswith(
+                    f"{self.model_name}:"
+                )
                 for name in model_names
-            ):
+            )
+
+            if not model_available:
                 raise RuntimeError(
-                    f"Ollama model '{self.model_name}' is not installed. "
+                    f"Ollama model '{self.model_name}' "
+                    "is not installed. "
                     f"Run: ollama pull {self.model_name}"
                 )
 
             print(
-                f"[VectorStore] Ollama connected. "
+                "[VectorStore] Ollama connected. "
                 f"Embedding model: {self.model_name}"
             )
 
         except requests.RequestException as e:
+
             raise RuntimeError(
                 "Could not connect to Ollama at "
-                f"{self.ollama_url}. Make sure Ollama is running."
+                f"{self.ollama_url}. "
+                "Make sure Ollama is running."
             ) from e
 
-    def _embed(self, texts, batch_size=32):
+    # ============================================================
+    # EMBEDDINGS
+    # ============================================================
+
+    def _embed(
+        self,
+        texts: Union[str, List[str]],
+        batch_size: int = 32,
+    ) -> np.ndarray:
         """
         Generate embeddings using Ollama.
 
-        Ollama's /api/embeddings endpoint accepts one text at a time,
-        so requests are sent individually.
+        Ollama's embeddings endpoint accepts one text
+        at a time, so requests are performed sequentially.
         """
 
         if isinstance(texts, str):
             texts = [texts]
 
+        if not texts:
+            return np.empty(
+                (0, self.dimension),
+                dtype="float32",
+            )
+
         embeddings = []
 
         total = len(texts)
 
-        for i, text in enumerate(texts, start=1):
+        for index, text in enumerate(
+            texts,
+            start=1,
+        ):
+
+            if text is None:
+                text = ""
+
+            text = str(text)
+
             try:
+
                 response = requests.post(
                     self.embedding_url,
                     json={
@@ -97,98 +150,219 @@ class VectorStore:
                 data = response.json()
 
                 if "embedding" not in data:
+
                     raise RuntimeError(
-                        f"Ollama response does not contain an embedding: {data}"
+                        "Ollama response does not contain "
+                        f"an embedding: {data}"
                     )
 
                 embedding = data["embedding"]
 
                 if len(embedding) != self.dimension:
+
                     raise RuntimeError(
-                        f"Unexpected embedding dimension: {len(embedding)}. "
+                        "Unexpected embedding dimension: "
+                        f"{len(embedding)}. "
                         f"Expected {self.dimension}."
                     )
 
-                embeddings.append(embedding)
+                embeddings.append(
+                    embedding
+                )
 
-                if i % batch_size == 0 or i == total:
+                if (
+                    index % batch_size == 0
+                    or index == total
+                ):
+
                     print(
-                        f"[VectorStore] Generated embeddings: "
-                        f"{i}/{total}"
+                        "[VectorStore] Generated embeddings: "
+                        f"{index}/{total}"
                     )
 
             except requests.RequestException as e:
+
                 raise RuntimeError(
-                    f"Failed to generate embedding {i}/{total}: {e}"
+                    f"Failed to generate embedding "
+                    f"{index}/{total}: {e}"
                 ) from e
 
-        embeddings = np.array(
+        embeddings_array = np.asarray(
             embeddings,
             dtype="float32",
         )
 
-        # Normalize vectors so inner product becomes cosine similarity
-        faiss.normalize_L2(embeddings)
+        if embeddings_array.ndim != 2:
 
-        return embeddings
-
-    def _build_text_representation(self, chunk):
-        """Convert a code chunk into text suitable for embedding."""
-
-        class_name = chunk.get("class_name") or ""
-        method_name = chunk.get("method_name") or ""
-
-        annotations_list = chunk.get("annotations", [])
-        annotations = " ".join(annotations_list)
-
-        calls = " ".join(chunk.get("calls", []))
-
-        code = chunk.get("code_content") or ""
-
-        chunk_type = chunk.get(
-            "chunk_type",
-            "METHOD",
-        )
-
-        # Give annotations additional semantic importance.
-        annotation_boost = ""
-
-        if annotations:
-            annotation_boost = (
-                f"ANNOTATIONS: "
-                f"{annotations} "
-                f"{annotations} "
-                f"{annotations}"
+            raise RuntimeError(
+                "Invalid embedding matrix shape: "
+                f"{embeddings_array.shape}"
             )
 
-        text_repr = (
-            f"Type: {chunk_type} | "
-            f"Class: {class_name} | "
+        if (
+            embeddings_array.shape[1]
+            != self.dimension
+        ):
+
+            raise RuntimeError(
+                "Embedding matrix dimension mismatch. "
+                f"Got {embeddings_array.shape[1]}, "
+                f"expected {self.dimension}."
+            )
+
+        # Normalize vectors so inner product behaves
+        # like cosine similarity.
+        faiss.normalize_L2(
+            embeddings_array
+        )
+
+        return embeddings_array
+
+    # ============================================================
+    # TEXT REPRESENTATION
+    # ============================================================
+
+    def _build_text_representation(
+        self,
+        chunk: Dict[str, Any],
+    ) -> str:
+        """
+        Convert a code chunk into semantic text
+        used for embedding generation.
+        """
+
+        class_name = str(
+            chunk.get("class_name")
+            or ""
+        )
+
+        method_name = str(
+            chunk.get("method_name")
+            or ""
+        )
+
+        chunk_type = str(
+            chunk.get(
+                "chunk_type",
+                "METHOD",
+            )
+        )
+
+        annotations = chunk.get(
+            "annotations",
+            [],
+        )
+
+        if isinstance(
+            annotations,
+            str,
+        ):
+
+            annotations_text = annotations
+
+        else:
+
+            annotations_text = " ".join(
+                str(annotation)
+                for annotation in annotations
+            )
+
+        calls = chunk.get(
+            "calls",
+            [],
+        )
+
+        if isinstance(
+            calls,
+            str,
+        ):
+
+            calls_text = calls
+
+        else:
+
+            calls_text = " ".join(
+                str(call)
+                for call in calls
+            )
+
+        code = str(
+            chunk.get(
+                "code_content",
+                ""
+            )
+            or chunk.get(
+                "source_code",
+                ""
+            )
+            or ""
+        )
+
+        annotation_boost = ""
+
+        if annotations_text:
+
+            annotation_boost = (
+                f"ANNOTATIONS: "
+                f"{annotations_text} "
+                f"{annotations_text} "
+                f"{annotations_text}"
+            )
+
+        return (
+            f"Type: {chunk_type}\n"
+            f"Class: {class_name}\n"
             f"Method: {method_name}\n"
             f"{annotation_boost}\n"
-            f"Calls: {calls}\n"
+            f"Calls: {calls_text}\n"
             f"Code:\n{code}"
         ).strip()
 
-        return text_repr
+    # ============================================================
+    # BUILD INDEX
+    # ============================================================
 
-    def build_index(self, chunks, batch_size=32):
-        """Generate embeddings for chunks and build the FAISS index."""
+    def build_index(
+        self,
+        chunks: List[Dict[str, Any]],
+        batch_size: int = 32,
+    ):
+        """
+        Build a fresh FAISS index from code chunks.
+
+        IMPORTANT:
+        The metadata list and FAISS vector count are always
+        rebuilt together to prevent mismatches.
+        """
 
         if not chunks:
-            print("[VectorStore] Warning: No chunks to index.")
+
+            print(
+                "[VectorStore] Warning: "
+                "No chunks to index."
+            )
+
+            self.chunks = []
+
+            self.index = faiss.IndexFlatIP(
+                self.dimension
+            )
+
             return
 
-        self.chunks = chunks
+        # Always replace metadata before building.
+        self.chunks = list(chunks)
 
         texts = [
-            self._build_text_representation(chunk)
-            for chunk in chunks
+            self._build_text_representation(
+                chunk
+            )
+            for chunk in self.chunks
         ]
 
         print(
-            f"[VectorStore] Generating Ollama embeddings "
-            f"for {len(texts)} chunks..."
+            "[VectorStore] Generating Ollama "
+            f"embeddings for {len(texts)} chunks..."
         )
 
         embeddings = self._embed(
@@ -196,80 +370,180 @@ class VectorStore:
             batch_size=batch_size,
         )
 
-        # Reset index before adding new embeddings
+        if len(embeddings) != len(
+            self.chunks
+        ):
+
+            raise RuntimeError(
+                "Embedding count does not match "
+                "chunk count. "
+                f"Embeddings={len(embeddings)}, "
+                f"Chunks={len(self.chunks)}."
+            )
+
+        # Always create a completely fresh index.
         self.index = faiss.IndexFlatIP(
             self.dimension
         )
 
-        self.index.add(embeddings)
+        self.index.add(
+            embeddings
+        )
+
+        if (
+            self.index.ntotal
+            != len(self.chunks)
+        ):
+
+            raise RuntimeError(
+                "FAISS index count does not match "
+                "metadata count after indexing. "
+                f"Vectors={self.index.ntotal}, "
+                f"Metadata={len(self.chunks)}."
+            )
 
         print(
-            f"[VectorStore] Successfully indexed "
-            f"{len(chunks)} chunks into "
-            f"FAISS IndexFlatIP."
+            "[VectorStore] Successfully indexed "
+            f"{len(self.chunks)} chunks into "
+            "FAISS IndexFlatIP."
         )
 
         print(
-            f"[VectorStore] Embedding dimension: "
+            "[VectorStore] Embedding dimension: "
             f"{self.dimension}"
         )
 
-    def search(self, query, top_k=3):
-        """Search the FAISS index using an Ollama query embedding."""
+    # ============================================================
+    # SEARCH
+    # ============================================================
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 3,
+    ):
+        """
+        Search the FAISS index using an Ollama
+        query embedding.
+        """
+
+        if not query or not str(
+            query
+        ).strip():
+
+            return []
+
+        if top_k <= 0:
+            return []
 
         if self.index.ntotal == 0:
             return []
 
+        # Critical consistency check.
+        if self.index.ntotal != len(
+            self.chunks
+        ):
+
+            raise RuntimeError(
+                "FAISS index and metadata are out of sync. "
+                f"Vectors={self.index.ntotal}, "
+                f"Metadata={len(self.chunks)}. "
+                "Rebuild the index."
+            )
+
         query_embedding = self._embed(
-            [query]
+            [str(query)]
         )
 
-        # Never request more results than vectors available
         k = min(
-            top_k,
+            int(top_k),
             self.index.ntotal,
         )
 
-        scores, indices = self.index.search(
-            query_embedding,
-            k,
+        scores, indices = (
+            self.index.search(
+                query_embedding,
+                k,
+            )
         )
 
         results = []
 
-        for score, idx in zip(
+        for score, index in zip(
             scores[0],
             indices[0],
         ):
-            if (
-                idx != -1
-                and idx < len(self.chunks)
+
+            if index == -1:
+                continue
+
+            if index >= len(
+                self.chunks
             ):
-                results.append(
-                    (
-                        self.chunks[idx],
-                        float(score),
-                    )
+                continue
+
+            chunk = self.chunks[
+                int(index)
+            ]
+
+            results.append(
+                (
+                    chunk,
+                    float(score),
                 )
+            )
 
         return results
 
+    # ============================================================
+    # SAVE
+    # ============================================================
+
     def save_index(
         self,
-        index_path="cache/faiss_index.bin",
-        metadata_path="cache/chunks_meta.pkl",
+        index_path: str = (
+            "cache/faiss_index.bin"
+        ),
+        metadata_path: str = (
+            "cache/chunks_meta.pkl"
+        ),
     ):
-        """Save FAISS index and chunk metadata to disk."""
+        """
+        Save FAISS index and metadata.
 
-        os.makedirs(
-            os.path.dirname(index_path) or ".",
-            exist_ok=True,
+        Refuses to save inconsistent state.
+        """
+
+        if self.index.ntotal != len(
+            self.chunks
+        ):
+
+            raise RuntimeError(
+                "Cannot save inconsistent vector store. "
+                f"Vectors={self.index.ntotal}, "
+                f"Metadata={len(self.chunks)}. "
+                "Rebuild the index first."
+            )
+
+        index_parent = os.path.dirname(
+            index_path
         )
 
-        os.makedirs(
-            os.path.dirname(metadata_path) or ".",
-            exist_ok=True,
+        metadata_parent = os.path.dirname(
+            metadata_path
         )
+
+        if index_parent:
+            os.makedirs(
+                index_parent,
+                exist_ok=True,
+            )
+
+        if metadata_parent:
+            os.makedirs(
+                metadata_parent,
+                exist_ok=True,
+            )
 
         faiss.write_index(
             self.index,
@@ -279,73 +553,169 @@ class VectorStore:
         with open(
             metadata_path,
             "wb",
-        ) as f:
+        ) as file:
+
             pickle.dump(
                 self.chunks,
-                f,
+                file,
             )
 
         print(
-            f"[VectorStore] Cached FAISS index "
+            "[VectorStore] Cached FAISS index "
             f"({self.index.ntotal} vectors) "
-            f"and metadata to disk."
+            "and metadata to disk."
         )
+
+    # ============================================================
+    # LOAD
+    # ============================================================
 
     def load_index(
         self,
-        index_path="cache/faiss_index.bin",
-        metadata_path="cache/chunks_meta.pkl",
-    ):
-        """Load FAISS index and metadata from disk."""
+        index_path: str = (
+            "cache/faiss_index.bin"
+        ),
+        metadata_path: str = (
+            "cache/chunks_meta.pkl"
+        ),
+    ) -> bool:
+        """
+        Load FAISS index and metadata.
+
+        IMPORTANT:
+        Cached vectors are accepted only when the number
+        of FAISS vectors exactly matches the metadata count.
+        """
 
         if not (
             os.path.exists(index_path)
             and os.path.exists(metadata_path)
         ):
+
             return False
 
         try:
+
             loaded_index = faiss.read_index(
                 index_path
             )
 
-            # Make sure cached index matches
-            # the current embedding model.
-            if loaded_index.d != self.dimension:
+            # ----------------------------------------------------
+            # Dimension validation
+            # ----------------------------------------------------
+
+            if (
+                loaded_index.d
+                != self.dimension
+            ):
+
                 print(
                     "[VectorStore] Cached FAISS index "
                     f"dimension is {loaded_index.d}, "
-                    f"but current embedding dimension "
+                    "but current embedding dimension "
                     f"is {self.dimension}."
                 )
 
                 print(
-                    "[VectorStore] Ignoring incompatible "
-                    "cached index."
+                    "[VectorStore] Ignoring "
+                    "incompatible cached index."
                 )
 
                 return False
 
-            self.index = loaded_index
-
             with open(
                 metadata_path,
                 "rb",
-            ) as f:
-                self.chunks = pickle.load(f)
+            ) as file:
+
+                loaded_chunks = pickle.load(
+                    file
+                )
+
+            if not isinstance(
+                loaded_chunks,
+                list,
+            ):
+
+                print(
+                    "[VectorStore] Cached metadata "
+                    "is not a list."
+                )
+
+                return False
+
+            # ----------------------------------------------------
+            # CRITICAL FIX:
+            # FAISS count must equal metadata count.
+            # ----------------------------------------------------
+
+            vector_count = (
+                loaded_index.ntotal
+            )
+
+            metadata_count = len(
+                loaded_chunks
+            )
+
+            if (
+                vector_count
+                != metadata_count
+            ):
+
+                print(
+                    "[VectorStore] Cached index "
+                    "is inconsistent."
+                )
+
+                print(
+                    "[VectorStore] "
+                    f"Vectors={vector_count}, "
+                    f"Metadata={metadata_count}."
+                )
+
+                print(
+                    "[VectorStore] Ignoring cached "
+                    "index. Rebuilding..."
+                )
+
+                return False
+
+            # ----------------------------------------------------
+            # Accept cache only after all checks pass.
+            # ----------------------------------------------------
+
+            self.index = loaded_index
+            self.chunks = loaded_chunks
 
             print(
-                f"[VectorStore] Successfully loaded "
-                f"cached FAISS index "
-                f"({self.index.ntotal} items)."
+                "[VectorStore] Successfully loaded "
+                "cached FAISS index "
+                f"({self.index.ntotal} vectors)."
+            )
+
+            print(
+                "[VectorStore] Metadata count: "
+                f"{len(self.chunks)}"
             )
 
             return True
 
         except Exception as e:
+
             print(
-                f"[VectorStore] Failed to load cached "
-                f"index: {e}. Rebuilding index..."
+                "[VectorStore] Failed to load "
+                f"cached index: {e}"
             )
+
+            print(
+                "[VectorStore] Rebuilding index..."
+            )
+
+            # Reset to a clean state.
+            self.index = faiss.IndexFlatIP(
+                self.dimension
+            )
+
+            self.chunks = []
 
             return False

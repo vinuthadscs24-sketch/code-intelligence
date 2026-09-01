@@ -1,30 +1,33 @@
-import os
-import shutil
-import tempfile
-from pathlib import Path
-from typing import Dict, Any, List, Optional
-from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+import asyncio
+from typing import Dict, Any, Optional
+import threading
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from loguru import logger
+from pydantic import BaseModel, Field
 
-# Import core engine modules
-from src.repo_utils import clone_repo_if_url
-from src.parser import JavaASTParser
-from src.chunker import CodeChunker
-from src.vector_store import VectorStore
-from src.graph_builder import CodeKnowledgeGraph
-from src.git_intelligence import GitIntelligence
-from src.context_builder import CodeIntelligenceContextBuilder
-from src.llm_engine import CodeIntelligenceEngine
+from src import config
+from src.generation.generator import LLMGenerator
+from src.pipeline import RAGPipeline
 
+
+# ============================================================
+# FastAPI App
+# ============================================================
 
 app = FastAPI(
-    title="AI Codebase Intelligence Engine",
-    description="REST API for Hybrid RRF Code Retrieval, Knowledge Graph Queries, Transitive Impact Analysis, and LLM Reasoning.",
-    version="1.0.0"
+    title="Code-Aware RAG API",
+    description="API for interacting with the Code-Aware RAG system.",
+    version="0.1.0",
 )
 
-# Enable CORS for React/Tailwind frontend integration
+
+# ============================================================
+# CORS
+# ============================================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,263 +36,863 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global State Container
-class EngineState:
-    repo_path: Optional[Path] = None
-    is_temp: bool = False
-    parser: Optional[JavaASTParser] = None
-    chunker: Optional[CodeChunker] = None
-    graph_db: Optional[CodeKnowledgeGraph] = None
-    vector_store: Optional[VectorStore] = None
-    git_intel: Optional[GitIntelligence] = None
-    context_builder: Optional[CodeIntelligenceContextBuilder] = None
-    engine: Optional[CodeIntelligenceEngine] = None
-    is_indexed: bool = False
+
+# ============================================================
+# Global State
+# ============================================================
+
+pipeline_locks: Dict[str, asyncio.Lock] = {}
+setup_status: Dict[str, Dict[str, Any]] = {}
 
 
-state = EngineState()
+# ============================================================
+# Request / Response Models
+# ============================================================
+
+class RepositorySetupRequest(BaseModel):
+    repo_id: str = Field(
+        ...,
+        description="Unique identifier for the repository.",
+    )
+
+    repo_url_or_path: str = Field(
+        ...,
+        description="Git repository URL or absolute local repository path.",
+    )
+
+    access_token: Optional[str] = Field(
+        None,
+        description="Access token for private repositories.",
+    )
+
+    force_reclone: bool = Field(
+        False,
+        description="Delete and reclone the repository if it exists.",
+    )
+
+    force_reindex: bool = Field(
+        False,
+        description="Rebuild all indexes.",
+    )
 
 
-# --- Request/Response Models ---
+class RepositorySetupResponse(BaseModel):
+    repo_id: str
+    message: str
+    index_status: str
+    repository_path: Optional[str] = None
+    task_id: Optional[str] = None
 
-class IndexRequest(BaseModel):
-    repo_path_or_url: Optional[str] = Field(None, example="https://github.com/spring-projects/spring-petclinic.git")
-    repo_url: Optional[str] = None
-    rebuild_index: bool = Field(False, description="Force rebuilding FAISS vector index")
 
-    @property
-    def url(self) -> str:
-        target = self.repo_path_or_url or self.repo_url
-        if not target:
-            raise ValueError("Must provide either repo_path_or_url or repo_url.")
-        return target
+class RepositoryStatusResponse(BaseModel):
+    repo_id: str
+    status: str
+    message: str
+    index_status: Optional[str] = None
+    repository_path: Optional[str] = None
 
 
 class QueryRequest(BaseModel):
-    question: Optional[str] = Field(None, example="How does user authentication work in this codebase?")
-    query: Optional[str] = None
-    top_k: int = Field(5, ge=1, le=20)
-    repo_id: Optional[str] = "default"
+    repo_id: str = Field(
+        ...,
+        description="Repository ID to query.",
+    )
 
-    @property
-    def text(self) -> str:
-        q = self.question or self.query
-        if not q:
-            raise ValueError("Must provide either question or query field.")
-        return q
+    sys_prompt: str = Field(
+        config.GENERATOR_PROMPT,
+        description="System prompt for LLM generation.",
+    )
+
+    query_text: str = Field(
+        ...,
+        description="Question about the repository.",
+    )
+
+    top_n_final: int = Field(
+        config.RETRIEVAL_VECTOR_TOP_K,
+        description="Number of final context chunks.",
+    )
+
+    indexes: list[str] = Field(
+        config.RETRIEVAL_INDEXES,
+        description="Indexes enabled for retrieval.",
+    )
+
+    vector_top_k: int = Field(
+        config.RETRIEVAL_VECTOR_TOP_K,
+        description="Top K vector results.",
+    )
+
+    bm25_top_k: int = Field(
+        config.RETRIEVAL_BM25_TOP_K,
+        description="Top K BM25 results.",
+    )
+
+    rewrite_query: Optional[str] = Field(
+        None,
+        description="Optional rewritten query.",
+    )
+
+    rewrite_prompt: Optional[str] = Field(
+        None,
+        description="Prompt used to rewrite the query.",
+    )
 
 
-class ProvenanceRequest(BaseModel):
-    file: str = Field(..., example="src/main/java/com/example/UserService.java")
-    method: str = Field(..., example="createUser")
-    start_line: int = Field(..., ge=1)
-    end_line: int = Field(..., ge=1)
+# ============================================================
+# Adaptive Response Models
+# ============================================================
+
+class AdaptiveQueryRequest(BaseModel):
+    repo_id: str = Field(
+        ...,
+        description="Repository ID to query.",
+    )
+
+    query_text: str = Field(
+        ...,
+        description="Question about the repository.",
+    )
+
+    sys_prompt: str = Field(
+        config.GENERATOR_PROMPT,
+        description="System prompt for LLM generation.",
+    )
+
+    top_n_final: int = Field(
+        config.RETRIEVAL_VECTOR_TOP_K,
+        description="Number of final context chunks.",
+    )
+
+    indexes: list[str] = Field(
+        config.RETRIEVAL_INDEXES,
+        description="Indexes enabled for retrieval.",
+    )
+
+    vector_top_k: int = Field(
+        config.RETRIEVAL_VECTOR_TOP_K,
+        description="Top K vector results.",
+    )
+
+    bm25_top_k: int = Field(
+        config.RETRIEVAL_BM25_TOP_K,
+        description="Top K BM25 results.",
+    )
 
 
-# --- API Endpoints ---
+# ============================================================
+# Startup / Shutdown
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Code-Aware RAG API starting up...")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Code-Aware RAG API shutting down...")
+
+
+# ============================================================
+# Repository Setup
+# ============================================================
+
+@app.post(
+    "/v1/code-rag/repository/setup",
+    response_model=RepositorySetupResponse,
+)
+async def setup_repository_endpoint(
+    request: RepositorySetupRequest,
+):
+
+    repo_id = (
+        request.repo_id
+        .replace("/", "_")
+        .replace(":", "_")
+    )
+
+    task_id = f"{repo_id}_{threading.get_ident()}"
+
+    if repo_id not in pipeline_locks:
+        pipeline_locks[repo_id] = asyncio.Lock()
+
+    if (
+        repo_id in setup_status
+        and setup_status[repo_id].get("status") == "pending"
+    ):
+        return RepositorySetupResponse(
+            repo_id=repo_id,
+            message="Repository setup already in progress",
+            index_status="In Progress",
+            task_id=setup_status[repo_id].get("task_id"),
+        )
+
+    logger.info(
+        f"Received setup request for repo_id={repo_id}, "
+        f"source={request.repo_url_or_path}"
+    )
+
+    try:
+
+        pipeline = RAGPipeline(
+            repo_id=repo_id
+        )
+
+        logger.info(
+            f"Created RAGPipeline for repo_id={repo_id}"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"Failed to initialize RAGPipeline for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Pipeline initialization error: {str(e)}",
+        )
+
+    setup_status[repo_id] = {
+        "status": "pending",
+        "message": "Repository setup started",
+        "index_status": "In Progress",
+        "task_id": task_id,
+        "repository_path": None,
+    }
+
+    def background_setup():
+
+        try:
+
+            success = pipeline.setup_repository(
+                repo_url_or_path=request.repo_url_or_path,
+                access_token=request.access_token,
+                force_reclone=request.force_reclone,
+                force_reindex=request.force_reindex,
+                apikey=None,
+            )
+
+            if success:
+
+                index_status = "Indexed Successfully"
+
+                faiss_exists = (
+                    pipeline.index_dir
+                    / config.FAISS_INDEX_FILENAME
+                ).exists()
+
+                bm25_exists = (
+                    pipeline.index_dir
+                    / config.BM25_INDEX_FILENAME
+                ).exists()
+
+                if (
+                    not request.force_reindex
+                    and faiss_exists
+                    and bm25_exists
+                ):
+                    index_status = (
+                        "Indexes Already Existed or Verified"
+                    )
+
+                setup_status[repo_id] = {
+                    "status": "completed",
+                    "message": "Repository setup process completed",
+                    "index_status": index_status,
+                    "task_id": task_id,
+                    "repository_path": (
+                        str(pipeline.repository_path)
+                        if pipeline.repository_path
+                        else None
+                    ),
+                }
+
+                logger.info(
+                    f"Repository setup completed: {repo_id}"
+                )
+
+            else:
+
+                setup_status[repo_id] = {
+                    "status": "failed",
+                    "message": "Repository setup failed",
+                    "index_status": "Failed",
+                    "task_id": task_id,
+                    "repository_path": (
+                        str(pipeline.repository_path)
+                        if pipeline.repository_path
+                        else None
+                    ),
+                }
+
+                logger.error(
+                    f"Repository setup failed: {repo_id}"
+                )
+
+        except Exception as e:
+
+            logger.exception(
+                f"Error during background setup for {repo_id}"
+            )
+
+            setup_status[repo_id] = {
+                "status": "failed",
+                "message": f"Error: {str(e)}",
+                "index_status": "Failed",
+                "task_id": task_id,
+                "repository_path": (
+                    str(pipeline.repository_path)
+                    if pipeline.repository_path
+                    else None
+                ),
+            }
+
+    thread = threading.Thread(
+        target=background_setup,
+        daemon=True,
+    )
+
+    thread.start()
+
+    return RepositorySetupResponse(
+        repo_id=repo_id,
+        message="Repository setup started in background",
+        index_status="In Progress",
+        repository_path=None,
+        task_id=task_id,
+    )
+
+
+# ============================================================
+# Helper: Load Pipeline
+# ============================================================
+
+def load_repository_pipeline(
+    repo_id: str,
+    indexes: list[str],
+) -> RAGPipeline:
+
+    pipeline = RAGPipeline(
+        repo_id=repo_id,
+        indexes=indexes,
+    )
+
+    if (
+        not pipeline.retriever.vector_index
+        and not pipeline.retriever.bm25_index
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Repository '{repo_id}' not found "
+                "or not indexed. Please set it up first."
+            ),
+        )
+
+    return pipeline
+
+
+# ============================================================
+# Helper: Retrieve Context
+# ============================================================
+
+async def retrieve_context(
+    pipeline: RAGPipeline,
+    request: QueryRequest | AdaptiveQueryRequest,
+):
+
+    retriever_query = request.query_text
+
+    if isinstance(request, QueryRequest):
+
+        if request.rewrite_query:
+
+            retriever_query = request.rewrite_query
+
+        elif request.rewrite_prompt:
+
+            retriever_query = (
+                await pipeline.retriever.rewrite_query(
+                    sys_prompt=request.rewrite_prompt,
+                    user_query=request.query_text,
+                    apikey=None,
+                )
+            )
+
+    context_chunks_meta = pipeline.query(
+        query_text=retriever_query,
+        top_n_final=request.top_n_final,
+        vector_top_k=request.vector_top_k,
+        bm25_top_k=request.bm25_top_k,
+        apikey=None,
+    )
+
+    logger.info(
+        f"Retrieved {len(context_chunks_meta)} context chunks."
+    )
+
+    return context_chunks_meta
+
+
+# ============================================================
+# Normal Query
+# ============================================================
+
+@app.post("/v1/code-rag/query")
+async def query_repository(
+    request: QueryRequest,
+):
+
+    repo_id = (
+        request.repo_id
+        .replace("/", "_")
+        .replace(":", "_")
+    )
+
+    logger.info(
+        f"Received query for repo_id='{repo_id}', "
+        f"query='{request.query_text[:50]}...'"
+    )
+
+    try:
+
+        pipeline = load_repository_pipeline(
+            repo_id,
+            request.indexes,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception:
+
+        logger.exception(
+            f"Failed to load RAGPipeline for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Repository '{repo_id}' not found "
+                "or not indexed."
+            ),
+        )
+
+    try:
+
+        context_chunks_meta = await retrieve_context(
+            pipeline,
+            request,
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"Retrieval error for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving context: {str(e)}",
+        )
+
+    try:
+
+        llm_generator = LLMGenerator()
+
+    except Exception as e:
+
+        logger.exception(
+            "Failed to initialize LLMGenerator"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"LLM Generator initialization error: {str(e)}",
+        )
+
+    try:
+
+        response = (
+            await llm_generator.generate_response_non_streaming(
+                apikey=None,
+                sys_prompy=request.sys_prompt,
+                user_query=request.query_text,
+                context_chunks=context_chunks_meta,
+            )
+        )
+
+        return response
+
+    except Exception as e:
+
+        logger.exception(
+            f"LLM generation error for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating LLM response: {str(e)}",
+        )
+
+
+# ============================================================
+# Adaptive Query
+# ============================================================
+
+@app.post("/v1/code-rag/query/adaptive")
+async def adaptive_query(
+    request: AdaptiveQueryRequest,
+):
+
+    repo_id = (
+        request.repo_id
+        .replace("/", "_")
+        .replace(":", "_")
+    )
+
+    logger.info(
+        f"Received ADAPTIVE query for repo_id='{repo_id}', "
+        f"query='{request.query_text[:80]}...'"
+    )
+
+    try:
+
+        pipeline = load_repository_pipeline(
+            repo_id,
+            request.indexes,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception:
+
+        logger.exception(
+            f"Failed to load adaptive pipeline for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Repository '{repo_id}' not found "
+                "or not indexed."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Retrieval
+    # --------------------------------------------------------
+
+    try:
+
+        context_chunks_meta = pipeline.query(
+            query_text=request.query_text,
+            top_n_final=request.top_n_final,
+            vector_top_k=request.vector_top_k,
+            bm25_top_k=request.bm25_top_k,
+            apikey=None,
+        )
+
+        logger.info(
+            f"Adaptive retrieval returned "
+            f"{len(context_chunks_meta)} context chunks."
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"Adaptive retrieval error for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving context: {str(e)}",
+        )
+
+    # --------------------------------------------------------
+    # Generate AI explanation
+    # --------------------------------------------------------
+
+    try:
+
+        llm_generator = LLMGenerator()
+
+        response = (
+            await llm_generator.generate_response_non_streaming(
+                apikey=None,
+                sys_prompy=request.sys_prompt,
+                user_query=request.query_text,
+                context_chunks=context_chunks_meta,
+            )
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"Adaptive LLM generation error for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating adaptive response: {str(e)}",
+        )
+
+    # --------------------------------------------------------
+    # Query type detection
+    # --------------------------------------------------------
+
+    query_lower = request.query_text.lower()
+
+    if any(
+        word in query_lower
+        for word in [
+            "caller",
+            "callers",
+            "who calls",
+            "who called",
+        ]
+    ):
+
+        response_type = "call_graph"
+
+    elif any(
+        word in query_lower
+        for word in [
+            "callee",
+            "callees",
+            "calls",
+            "dependencies",
+            "dependency",
+        ]
+    ):
+
+        response_type = "call_graph"
+
+    elif any(
+        word in query_lower
+        for word in [
+            "commit",
+            "commits",
+            "git history",
+            "history",
+            "changed",
+        ]
+    ):
+
+        response_type = "git_timeline"
+
+    elif any(
+        word in query_lower
+        for word in [
+            "impact",
+            "affected",
+            "affect",
+            "what breaks",
+        ]
+    ):
+
+        response_type = "impact_analysis"
+
+    else:
+
+        response_type = "code_explanation"
+
+    # --------------------------------------------------------
+    # Build structured adaptive response
+    # --------------------------------------------------------
+
+    return {
+        "response_type": response_type,
+        "query": request.query_text,
+        "answer": response,
+        "repository": repo_id,
+        "retrieval": {
+            "chunks_retrieved": len(context_chunks_meta),
+            "vector_top_k": request.vector_top_k,
+            "bm25_top_k": request.bm25_top_k,
+            "top_n_final": request.top_n_final,
+        },
+        "context": context_chunks_meta,
+    }
+
+
+# ============================================================
+# Streaming Query
+# ============================================================
+
+@app.post(
+    "/v1/code-rag/query/stream",
+)
+async def query_repository_stream(
+    request: QueryRequest,
+):
+
+    repo_id = (
+        request.repo_id
+        .replace("/", "_")
+        .replace(":", "_")
+    )
+
+    logger.info(
+        f"Received streaming query for repo_id='{repo_id}', "
+        f"query='{request.query_text[:50]}...'"
+    )
+
+    try:
+
+        pipeline = load_repository_pipeline(
+            repo_id,
+            request.indexes,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception:
+
+        logger.exception(
+            f"Failed to load pipeline for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Repository '{repo_id}' not found "
+                "or not indexed."
+            ),
+        )
+
+    try:
+
+        context_chunks_meta = await retrieve_context(
+            pipeline,
+            request,
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"Retrieval error for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving context: {str(e)}",
+        )
+
+    try:
+
+        llm_generator = LLMGenerator()
+
+    except Exception as e:
+
+        logger.exception(
+            "Failed to initialize LLMGenerator"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"LLM Generator initialization error: {str(e)}",
+        )
+
+    try:
+
+        response_stream_iterator = (
+            llm_generator.generate_response_stream(
+                apikey=None,
+                sys_prompy=request.sys_prompt,
+                user_query=request.query_text,
+                context_chunks=context_chunks_meta,
+            )
+        )
+
+        return StreamingResponse(
+            response_stream_iterator,
+            media_type="text/plain",
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"LLM streaming error for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating LLM response: {str(e)}",
+        )
+
+
+# ============================================================
+# Repository Status
+# ============================================================
+
+@app.get(
+    "/v1/code-rag/repository/status/{repo_id}",
+    response_model=RepositoryStatusResponse,
+)
+async def check_repository_setup_status(
+    repo_id: str,
+):
+
+    sanitized_repo_id = (
+        repo_id
+        .replace("/", "_")
+        .replace(":", "_")
+    )
+
+    if sanitized_repo_id not in setup_status:
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No setup process found for repository ID: "
+                f"{repo_id}"
+            ),
+        )
+
+    status_info = setup_status[sanitized_repo_id]
+
+    return RepositoryStatusResponse(
+        repo_id=repo_id,
+        status=status_info.get("status", "unknown"),
+        message=status_info.get("message", ""),
+        index_status=status_info.get("index_status"),
+        repository_path=status_info.get("repository_path"),
+    )
+
+
+# ============================================================
+# Health Check
+# ============================================================
 
 @app.get("/health")
-def health_check():
-    """Returns engine indexing and repository readiness status."""
+async def health_check():
+
     return {
-        "status": "online",
-        "indexed": state.is_indexed,
-        "repo_path": str(state.repo_path) if state.repo_path else None
+        "status": "healthy",
+        "message": "Code-Aware RAG API is running.",
     }
 
 
-@app.post("/api/repository/index")
-@app.post("/index")
-def index_repository(payload: IndexRequest):
-    """
-    Clones (if URL) or loads a local Java repository, parses ASTs, builds
-    the Knowledge Graph, and populates FAISS vector embeddings.
-    """
-    try:
-        target_url = payload.url
-        
-        # Clean up existing temporary repository if active
-        if state.is_temp and state.repo_path and state.repo_path.exists():
-            shutil.rmtree(state.repo_path, ignore_errors=True)
-
-        repo_path, is_temp = clone_repo_if_url(target_url)
-        if not repo_path.exists() or not repo_path.is_dir():
-            raise HTTPException(status_code=400, detail=f"Directory '{repo_path}' does not exist.")
-
-        # 1. Parse AST
-        parser = JavaASTParser()
-        extracted_data = []
-        for java_file in repo_path.rglob("*.java"):
-            if java_file.name in {"module-info.java", "package-info.java"}:
-                continue
-            try:
-                result = parser.parse_file(str(java_file))
-                if result:
-                    if isinstance(result, dict):
-                        extracted_data.append((Path(java_file), result))
-                    elif isinstance(result, (tuple, list)):
-                        tree = result[0]
-                        source_code = result[1] if len(result) > 1 else ""
-                        symbols = parser.extract_symbols_and_relations(tree, source_code)
-                        extracted_data.append((Path(java_file), {
-                            "tree": tree,
-                            "source_code": source_code,
-                            "symbols": symbols
-                        }))
-            except Exception:
-                pass
-
-        if not extracted_data:
-            raise HTTPException(status_code=400, detail="No valid Java files found or parsed.")
-
-        # 2. Chunking
-        chunker = CodeChunker(parser=parser)
-        chunks = chunker.create_chunks(extracted_data)
-
-        # 3. Knowledge Graph
-        kg = CodeKnowledgeGraph()
-        kg.build_graph_from_chunks(chunks)
-
-        # 4. Vector Store
-        store = VectorStore()
-        if payload.rebuild_index or not store.load_index():
-            store.build_index(chunks)
-            store.save_index()
-
-        # 5. Git & Context Engine
-        git_intel = GitIntelligence(repo_path=str(repo_path))
-        context_builder = CodeIntelligenceContextBuilder(git_intel=git_intel)
-        engine = CodeIntelligenceEngine(
-            repo_path=str(repo_path),
-            vector_store=store,
-            graph_db=kg,
-            context_builder=context_builder
-        )
-
-        # Update State
-        state.repo_path = repo_path
-        state.is_temp = is_temp
-        state.parser = parser
-        state.chunker = chunker
-        state.graph_db = kg
-        state.vector_store = store
-        state.git_intel = git_intel
-        state.context_builder = context_builder
-        state.engine = engine
-        state.is_indexed = True
-
-        summary = kg.get_summary()
-        return {
-            "status": "success",
-            "message": "Repository indexed successfully.",
-            "repoName": repo_path.name,
-            "total_files": len(extracted_data),
-            "total_chunks": len(chunks),
-            "graph_summary": summary
-        }
-
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Indexing failed: {str(e)}")
-
-
-@app.post("/api/query")
-@app.post("/ask")
-def query_codebase(payload: QueryRequest):
-    """
-    Unified end-to-end Q&A endpoint.
-    Performs Hybrid RRF search, builds contextual prompts, and queries LLM.
-    """
-    if not state.is_indexed or not state.engine:
-        raise HTTPException(status_code=400, detail="No repository indexed. Call POST /index first.")
-
-    try:
-        q_text = payload.text
-        response = state.engine.answer_query(q_text, top_k=payload.top_k)
-        return {
-            "query": q_text,
-            "answer": response.get("answer", "No response generated."),
-            "retrieved_chunks": response.get("retrieved_chunks", []),
-            "context_used": response.get("context", {})
-        }
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
-
-
-@app.get("/dependencies/{entity_name}")
-def get_entity_dependencies(entity_name: str):
-    """Retrieves callers, callees, and imports for a class or method entity."""
-    if not state.is_indexed or not state.graph_db:
-        raise HTTPException(status_code=400, detail="No repository indexed.")
-
-    callers = state.graph_db.get_callers(entity_name)
-    callees = state.graph_db.get_callees(entity_name)
-
-    return {
-        "entity": entity_name,
-        "callers": callers,
-        "callees": callees
-    }
-
-
-@app.get("/impact/{entity_name}")
-def get_impact_analysis(
-    entity_name: str, 
-    max_depth: int = Query(3, ge=1, le=5)
-):
-    """Calculates multi-level transitive impact analysis using BFS across the Knowledge Graph."""
-    if not state.is_indexed or not state.graph_db:
-        raise HTTPException(status_code=400, detail="No repository indexed.")
-
-    from collections import deque
-    visited = {entity_name}
-    queue = deque([(entity_name, 0)])
-    affected_entities = []
-
-    while queue:
-        current_entity, distance = queue.popleft()
-        if distance >= max_depth:
-            continue
-
-        callers = state.graph_db.get_callers(current_entity)
-        for caller in callers:
-            if caller not in visited:
-                visited.add(caller)
-                affected_entities.append({
-                    "entity": caller,
-                    "distance": distance + 1
-                })
-                queue.append((caller, distance + 1))
-
-    return {
-        "target_entity": entity_name,
-        "max_depth": max_depth,
-        "total_affected": len(affected_entities),
-        "affected": affected_entities
-    }
-
-
-@app.post("/history/why-changed")
-def explain_method_provenance(payload: ProvenanceRequest):
-    """Explains why a specific method/line range changed using Git blame, show, and diff context."""
-    if not state.is_indexed or not state.engine:
-        raise HTTPException(status_code=400, detail="No repository indexed.")
-
-    try:
-        response = state.engine.explain_why_changed(
-            file_path=payload.file,
-            method_name=payload.method,
-            start_line=payload.start_line,
-            end_line=payload.end_line
-        )
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Provenance lookup failed: {str(e)}")
-
+# ============================================================
+# Direct Execution
+# ============================================================
 
 if __name__ == "__main__":
+
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+    logger.info(
+        "Starting Code-Aware RAG API..."
+    )
+
+    uvicorn.run(
+        app,
+        host=config.API_HOST,
+        port=config.API_PORT,
+        reload=config.API_RELOAD,
+    )

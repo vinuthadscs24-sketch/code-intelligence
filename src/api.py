@@ -1,3 +1,4 @@
+
 import asyncio
 from typing import List, Dict, Any, Optional
 import threading
@@ -42,7 +43,6 @@ app.add_middleware(
 # ============================================================
 
 pipeline_locks: Dict[str, asyncio.Lock] = {}
-
 setup_status: Dict[str, Dict[str, Any]] = {}
 
 
@@ -138,6 +138,14 @@ class QueryRequest(BaseModel):
         None,
         description="Prompt used to rewrite the query."
     )
+
+
+class AdaptiveQueryResponse(BaseModel):
+    response_type: str
+    answer: Any
+    query: str
+    repo_id: str
+    data: Dict[str, Any]
 
 
 # ============================================================
@@ -434,7 +442,9 @@ async def query_repository(
 
     except Exception as e:
 
-        logger.exception("Failed to initialize LLMGenerator")
+        logger.exception(
+            "Failed to initialize LLMGenerator"
+        )
 
         raise HTTPException(
             status_code=500,
@@ -468,6 +478,285 @@ async def query_repository(
             status_code=500,
             detail=f"Error generating LLM response: {str(e)}",
         )
+
+
+# ============================================================
+# ADAPTIVE QUERY
+# ============================================================
+
+@app.post(
+    "/v1/code-rag/query/adaptive",
+    response_model=AdaptiveQueryResponse,
+)
+async def adaptive_query(
+    request: QueryRequest
+):
+
+    repo_id = (
+        request.repo_id
+        .replace("/", "_")
+        .replace(":", "_")
+    )
+
+    query = request.query_text.strip()
+    query_lower = query.lower()
+
+    logger.info(
+        f"Received adaptive query for "
+        f"repo_id='{repo_id}', query='{query[:80]}...'"
+    )
+
+    # --------------------------------------------------------
+    # Detect query type
+    # --------------------------------------------------------
+
+    if any(
+        word in query_lower
+        for word in [
+            "who calls",
+            "callers",
+            "caller",
+            "depends on",
+            "dependency",
+            "dependencies",
+            "calls from",
+            "called by",
+        ]
+    ):
+
+        response_type = "dependency_graph"
+
+    elif any(
+        word in query_lower
+        for word in [
+            "impact",
+            "affected",
+            "affect",
+            "break if",
+            "what will happen if",
+            "what changes if",
+        ]
+    ):
+
+        response_type = "impact_analysis"
+
+    elif any(
+        word in query_lower
+        for word in [
+            "git",
+            "commit",
+            "commits",
+            "history",
+            "timeline",
+            "changed in",
+            "change history",
+        ]
+    ):
+
+        response_type = "git_timeline"
+
+    elif any(
+        word in query_lower
+        for word in [
+            "endpoint",
+            "endpoints",
+            "api",
+            "apis",
+            "route",
+            "routes",
+            "controller",
+            "mapping",
+            "rest",
+            "http",
+        ]
+    ):
+
+        response_type = "api_endpoints"
+
+    else:
+
+        response_type = "code_explanation"
+
+    # --------------------------------------------------------
+    # Load pipeline
+    # --------------------------------------------------------
+
+    try:
+
+        pipeline = RAGPipeline(
+            repo_id=repo_id,
+            indexes=request.indexes,
+        )
+
+        if (
+            not pipeline.retriever.vector_index
+            and not pipeline.retriever.bm25_index
+        ):
+
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Repository '{repo_id}' not found "
+                    "or not indexed."
+                ),
+            )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        logger.exception(
+            f"Failed to load adaptive pipeline for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Repository '{repo_id}' not found "
+                "or not indexed."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Retrieval
+    # --------------------------------------------------------
+
+    try:
+
+        retriever_query = request.query_text
+
+        if request.rewrite_query:
+
+            retriever_query = request.rewrite_query
+
+        elif request.rewrite_prompt:
+
+            retriever_query = (
+                await pipeline.retriever.rewrite_query(
+                    sys_prompt=request.rewrite_prompt,
+                    user_query=request.query_text,
+                    apikey=None,
+                )
+            )
+
+        context_chunks = pipeline.query(
+            query_text=retriever_query,
+            top_n_final=request.top_n_final,
+            vector_top_k=request.vector_top_k,
+            bm25_top_k=request.bm25_top_k,
+            apikey=None,
+        )
+
+        logger.info(
+            f"Adaptive retrieval returned "
+            f"{len(context_chunks)} chunks."
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"Adaptive retrieval failed for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Adaptive retrieval error: {str(e)}",
+        )
+
+    # --------------------------------------------------------
+    # LLM generation
+    # --------------------------------------------------------
+
+    try:
+
+        llm_generator = LLMGenerator()
+
+        answer = (
+            await llm_generator.generate_response_non_streaming(
+                apikey=None,
+                sys_prompy=request.sys_prompt,
+                user_query=request.query_text,
+                context_chunks=context_chunks,
+            )
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"Adaptive LLM generation failed for {repo_id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Adaptive generation error: {str(e)}",
+        )
+
+    # --------------------------------------------------------
+    # Build frontend data
+    # --------------------------------------------------------
+
+    files = []
+    symbols = []
+    contexts = []
+
+    for chunk in context_chunks:
+
+        file_name = (
+            chunk.get("file_name")
+            or chunk.get("file")
+            or chunk.get("file_path")
+            or ""
+        )
+
+        if file_name and file_name not in files:
+            files.append(str(file_name))
+
+        class_name = chunk.get("class_name")
+        method_name = chunk.get("method_name")
+
+        if class_name:
+            symbols.append(str(class_name))
+
+        if method_name:
+            symbols.append(str(method_name))
+
+        contexts.append({
+            "chunk_id": chunk.get("chunk_id"),
+            "file_name": file_name,
+            "class_name": class_name,
+            "method_name": method_name,
+            "start_line": chunk.get("start_line"),
+            "end_line": chunk.get("end_line"),
+            "code_content": (
+                chunk.get("code_content")
+                or chunk.get("source_code")
+                or ""
+            ),
+            "sources": chunk.get("sources", []),
+            "vector_rank": chunk.get("vector_rank"),
+            "graph_rank": chunk.get("graph_rank"),
+            "combined_score": chunk.get("combined_score"),
+            "graph_callers": chunk.get("graph_callers", []),
+            "graph_callees": chunk.get("graph_callees", []),
+        })
+
+    # --------------------------------------------------------
+    # Return adaptive response
+    # --------------------------------------------------------
+
+    return AdaptiveQueryResponse(
+        response_type=response_type,
+        answer=answer,
+        query=query,
+        repo_id=repo_id,
+        data={
+            "files": files,
+            "symbols": list(dict.fromkeys(symbols)),
+            "context_count": len(contexts),
+            "contexts": contexts,
+        },
+    )
 
 
 # ============================================================
@@ -508,6 +797,7 @@ async def query_repository_stream(
             not pipeline.retriever.vector_index
             and not pipeline.retriever.bm25_index
         ):
+
             raise HTTPException(
                 status_code=404,
                 detail=(
@@ -699,3 +989,4 @@ if __name__ == "__main__":
         port=config.API_PORT,
         reload=config.API_RELOAD,
     )
+

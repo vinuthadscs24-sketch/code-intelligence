@@ -28,7 +28,7 @@ class JavaASTParser:
             source_code = f.read()
 
         tree = self.parser.parse(
-            bytes(source_code, "utf-8")
+            source_code.encode("utf-8")
         )
 
         return tree, source_code
@@ -43,14 +43,15 @@ class JavaASTParser:
         source_code: str
     ) -> Dict[str, Any]:
 
-        classes: List[Dict[str, Any]] = []
-        methods: List[Dict[str, Any]] = []
-        method_calls: List[Dict[str, Any]] = []
-        fields: List[Dict[str, Any]] = []
-        interfaces: List[Dict[str, Any]] = []
+        classes = []
+        methods = []
+        method_calls = []
+        fields = []
+        interfaces = []
 
         if tree is None or not tree.root_node:
             return {
+                "package": "default",
                 "classes": [],
                 "methods": [],
                 "method_calls": [],
@@ -58,19 +59,13 @@ class JavaASTParser:
                 "fields": []
             }
 
-        source_bytes = bytes(
-            source_code,
-            "utf-8"
-        )
-
-        current_class = "Global"
+        source_bytes = source_code.encode("utf-8")
 
         # ========================================================
-        # HELPER: GET NODE TEXT
+        # HELPERS
         # ========================================================
 
         def get_text(node):
-
             if node is None:
                 return ""
 
@@ -81,12 +76,7 @@ class JavaASTParser:
                 errors="replace"
             )
 
-        # ========================================================
-        # HELPER: EXTRACT ANNOTATIONS
-        # ========================================================
-
         def extract_annotations(node):
-
             annotations = []
 
             modifiers = node.child_by_field_name(
@@ -94,22 +84,42 @@ class JavaASTParser:
             )
 
             if modifiers:
-
                 for child in modifiers.children:
-
                     if child.type in (
                         "marker_annotation",
                         "annotation"
                     ):
-
                         annotations.append(
                             get_text(child)
                         )
 
             return annotations
 
+        def find_package(node):
+            if node.type == "package_declaration":
+                return get_text(node).replace(
+                    "package",
+                    "",
+                    1
+                ).replace(
+                    ";",
+                    ""
+                ).strip()
+
+            for child in node.children:
+                result = find_package(child)
+
+                if result:
+                    return result
+
+            return "default"
+
+        package = find_package(
+            tree.root_node
+        )
+
         # ========================================================
-        # EXTRACT METHOD CALLS
+        # METHOD CALL EXTRACTION
         # ========================================================
 
         def extract_method_calls(
@@ -156,7 +166,6 @@ class JavaASTParser:
                     if method_called:
 
                         calls.append({
-
                             "method_called":
                                 method_called,
 
@@ -192,7 +201,7 @@ class JavaASTParser:
                         )
 
                 # ------------------------------------------------
-                # CONTINUE AST TRAVERSAL
+                # TRAVERSE CHILDREN
                 # ------------------------------------------------
 
                 for child in node.children:
@@ -206,9 +215,10 @@ class JavaASTParser:
         # AST TRAVERSAL
         # ========================================================
 
-        def traverse(node):
-
-            nonlocal current_class
+        def traverse(
+            node,
+            current_class="Global"
+        ):
 
             # ====================================================
             # CLASS
@@ -222,38 +232,79 @@ class JavaASTParser:
                     )
                 )
 
-                if name_node:
-
-                    class_name = get_text(
-                        name_node
-                    )
-
-                    annotations = (
-                        extract_annotations(node)
-                    )
-
-                    classes.append({
-
-                        "name":
-                            class_name,
-
-                        "type":
-                            "CLASS",
-
-                        "annotations":
-                            annotations
-                    })
-
-                    previous_class = current_class
-
-                    current_class = class_name
-
-                    for child in node.children:
-                        traverse(child)
-
-                    current_class = previous_class
-
+                if not name_node:
                     return
+
+                class_name = get_text(
+                    name_node
+                )
+
+                annotations = (
+                    extract_annotations(node)
+                )
+
+                # ------------------------------------------------
+                # EXTENDS
+                # ------------------------------------------------
+
+                extends = None
+
+                superclass_node = (
+                    node.child_by_field_name(
+                        "superclass"
+                    )
+                )
+
+                if superclass_node:
+                    extends = get_text(
+                        superclass_node
+                    )
+
+                # ------------------------------------------------
+                # IMPLEMENTS
+                # ------------------------------------------------
+
+                implements = []
+
+                interfaces_node = (
+                    node.child_by_field_name(
+                        "interfaces"
+                    )
+                )
+
+                if interfaces_node:
+
+                    for child in interfaces_node.children:
+
+                        if child.type in (
+                            "type_identifier",
+                            "generic_type",
+                            "scoped_type_identifier"
+                        ):
+                            implements.append(
+                                get_text(child)
+                            )
+
+                classes.append({
+                    "name": class_name,
+                    "type": "CLASS",
+                    "package": package,
+                    "annotations": annotations,
+                    "extends": extends,
+                    "implements": implements
+                })
+
+                # ------------------------------------------------
+                # Traverse class body
+                # ------------------------------------------------
+
+                for child in node.children:
+                    traverse(
+                        child,
+                        class_name
+                    )
+
+                return
 
             # ====================================================
             # INTERFACE
@@ -267,49 +318,40 @@ class JavaASTParser:
                     )
                 )
 
-                if name_node:
+                if not name_node:
+                    return
 
-                    interface_name = get_text(
-                        name_node
-                    )
+                interface_name = get_text(
+                    name_node
+                )
 
-                    annotations = (
-                        extract_annotations(node)
-                    )
+                annotations = (
+                    extract_annotations(node)
+                )
 
-                    interfaces.append(
-                        interface_name
-                    )
+                interfaces.append(
+                    interface_name
+                )
 
-                    classes.append({
-
-                        "name":
-                            interface_name,
-
-                        "type":
-                            "INTERFACE",
-
-                        "annotations":
-                            annotations
-                    })
-
-                # Continue traversal inside interface
-                previous_class = current_class
-
-                if name_node:
-                    current_class = get_text(
-                        name_node
-                    )
+                classes.append({
+                    "name": interface_name,
+                    "type": "INTERFACE",
+                    "package": package,
+                    "annotations": annotations,
+                    "extends": None,
+                    "implements": []
+                })
 
                 for child in node.children:
-                    traverse(child)
-
-                current_class = previous_class
+                    traverse(
+                        child,
+                        interface_name
+                    )
 
                 return
 
             # ====================================================
-            # FIELD DECLARATION
+            # FIELD
             # ====================================================
 
             if node.type == "field_declaration":
@@ -332,37 +374,34 @@ class JavaASTParser:
 
                 for child in node.children:
 
-                    if child.type == "variable_declarator":
+                    if child.type != "variable_declarator":
+                        continue
 
-                        field_name_node = (
-                            child.child_by_field_name(
-                                "name"
-                            )
+                    field_name_node = (
+                        child.child_by_field_name(
+                            "name"
                         )
+                    )
 
-                        if field_name_node:
+                    if not field_name_node:
+                        continue
 
-                            field_name = get_text(
-                                field_name_node
-                            )
+                    field_name = get_text(
+                        field_name_node
+                    )
 
-                            fields.append({
-
-                                "name":
-                                    field_name,
-
-                                "type":
-                                    field_type,
-
-                                "enclosing_class":
-                                    current_class,
-
-                                "annotations":
-                                    annotations
-                            })
-
-                # Don't return here because
-                # nested structures may exist.
+                    fields.append({
+                        "name": field_name,
+                        "type": field_type,
+                        "enclosing_class":
+                            current_class,
+                        "annotations":
+                            annotations,
+                        "start_line":
+                            node.start_point[0] + 1,
+                        "end_line":
+                            node.end_point[0] + 1
+                    })
 
             # ====================================================
             # METHOD
@@ -418,11 +457,52 @@ class JavaASTParser:
                     )
 
                 # ------------------------------------------------
-                # Store method
+                # PARAMETERS
                 # ------------------------------------------------
 
-                method_data = {
+                parameters = []
 
+                parameters_node = (
+                    node.child_by_field_name(
+                        "parameters"
+                    )
+                )
+
+                if parameters_node:
+
+                    for child in parameters_node.children:
+
+                        if child.type in (
+                            "formal_parameter",
+                            "spread_parameter"
+                        ):
+                            parameters.append(
+                                get_text(child)
+                            )
+
+                # ------------------------------------------------
+                # RETURN TYPE
+                # ------------------------------------------------
+
+                return_type_node = (
+                    node.child_by_field_name(
+                        "type"
+                    )
+                )
+
+                return_type = (
+                    get_text(return_type_node)
+                    if return_type_node
+                    else ""
+                )
+
+                signature = (
+                    f"{return_type} "
+                    f"{method_name}"
+                    f"({', '.join(parameters)})"
+                ).strip()
+
+                method_data = {
                     "name":
                         method_name,
 
@@ -450,22 +530,23 @@ class JavaASTParser:
                     "end_line":
                         end_line,
 
+                    "parameters":
+                        parameters,
+
+                    "return_type":
+                        return_type,
+
                     "signature":
-                        f"{method_name}()"
+                        signature
                 }
 
                 methods.append(
                     method_data
                 )
 
-                # ------------------------------------------------
-                # Store global method call records
-                # ------------------------------------------------
-
                 for call in calls:
 
                     method_calls.append({
-
                         "caller_class":
                             current_class,
 
@@ -488,17 +569,21 @@ class JavaASTParser:
                             )
                     })
 
+                # Do not recursively traverse method body again.
                 return
 
             # ====================================================
-            # CONTINUE
+            # CONTINUE TRAVERSAL
             # ====================================================
 
             for child in node.children:
-                traverse(child)
+                traverse(
+                    child,
+                    current_class
+                )
 
         # ========================================================
-        # START TRAVERSAL
+        # START
         # ========================================================
 
         traverse(
@@ -510,6 +595,8 @@ class JavaASTParser:
         # ========================================================
 
         return {
+            "package":
+                package,
 
             "classes":
                 classes,
@@ -540,8 +627,7 @@ class JavaASTParser:
         if node is None:
             return ""
 
-        source_bytes = bytes(
-            source_code,
+        source_bytes = source_code.encode(
             "utf-8"
         )
 

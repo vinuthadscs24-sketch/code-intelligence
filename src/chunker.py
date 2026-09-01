@@ -58,10 +58,16 @@ class CodeChunker:
         # ---------------------------------------------------------
 
         symbols = {}
+
         if isinstance(data, dict):
+
             if "methods" in data:
                 symbols = data
-            elif isinstance(data.get("symbols"), dict):
+
+            elif isinstance(
+                data.get("symbols"),
+                dict
+            ):
                 symbols = data["symbols"]
 
         if (
@@ -72,7 +78,9 @@ class CodeChunker:
                 "extract_symbols_and_relations"
             )
         ):
+
             try:
+
                 symbols = (
                     self.parser
                     .extract_symbols_and_relations(
@@ -80,13 +88,25 @@ class CodeChunker:
                         source_code
                     )
                 )
+
             except Exception as e:
-                logger.warning(f"Could not extract symbols for {file_name}: {e}")
+
+                logger.warning(
+                    f"Could not extract symbols "
+                    f"for {file_name}: {e}"
+                )
+
                 symbols = {}
 
         methods = (
-            symbols.get("methods", [])
-            if isinstance(symbols, dict)
+            symbols.get(
+                "methods",
+                []
+            )
+            if isinstance(
+                symbols,
+                dict
+            )
             else []
         )
 
@@ -118,6 +138,10 @@ class CodeChunker:
                     []
                 )
 
+                # -------------------------------------------------
+                # Get raw calls
+                # -------------------------------------------------
+
                 raw_calls = method.get(
                     "calls",
                     method.get(
@@ -127,20 +151,108 @@ class CodeChunker:
                 )
 
                 # -------------------------------------------------
-                # Normalize calls (Handles string or dict items)
+                # Preserve complete call information
+                #
+                # IMPORTANT:
+                # Do NOT convert dictionaries into strings.
+                #
+                # This preserves:
+                #
+                # method_called
+                # object_expression
+                # caller_class
+                # caller_method
+                # etc.
                 # -------------------------------------------------
 
                 calls = []
-                if isinstance(raw_calls, list):
+
+                if isinstance(
+                    raw_calls,
+                    list
+                ):
+
                     for call in raw_calls:
-                        if isinstance(call, dict):
-                            c_name = call.get("method_called") or call.get("name")
-                            if c_name:
-                                calls.append(str(c_name))
+
+                        if isinstance(
+                            call,
+                            dict
+                        ):
+
+                            # Make a copy so the parser's
+                            # original data is never mutated.
+                            call_data = dict(call)
+
+                            method_called = (
+                                call_data.get(
+                                    "method_called"
+                                )
+                                or call_data.get(
+                                    "name"
+                                )
+                                or call_data.get(
+                                    "method"
+                                )
+                            )
+
+                            if method_called:
+
+                                call_data[
+                                    "method_called"
+                                ] = str(
+                                    method_called
+                                )
+
+                                calls.append(
+                                    call_data
+                                )
+
                         elif call:
-                            calls.append(str(call))
+
+                            calls.append(
+                                str(call)
+                            )
+
                 elif raw_calls:
-                    calls.append(str(raw_calls))
+
+                    if isinstance(
+                        raw_calls,
+                        dict
+                    ):
+
+                        call_data = dict(
+                            raw_calls
+                        )
+
+                        method_called = (
+                            call_data.get(
+                                "method_called"
+                            )
+                            or call_data.get(
+                                "name"
+                            )
+                            or call_data.get(
+                                "method"
+                            )
+                        )
+
+                        if method_called:
+
+                            call_data[
+                                "method_called"
+                            ] = str(
+                                method_called
+                            )
+
+                            calls.append(
+                                call_data
+                            )
+
+                    else:
+
+                        calls.append(
+                            str(raw_calls)
+                        )
 
                 # -------------------------------------------------
                 # Normalize annotations
@@ -150,16 +262,77 @@ class CodeChunker:
                     annotations,
                     list
                 ):
+
                     ann_str = ", ".join(
-                        map(str, annotations)
+                        map(
+                            str,
+                            annotations
+                        )
                     )
+
                 else:
+
                     ann_str = str(
                         annotations
                     )
 
+                # -------------------------------------------------
+                # Build readable call representation
+                # for embeddings / display
+                # -------------------------------------------------
+
+                call_display = []
+
+                for call in calls:
+
+                    if isinstance(
+                        call,
+                        dict
+                    ):
+
+                        method_called = (
+                            call.get(
+                                "method_called"
+                            )
+                            or call.get(
+                                "name"
+                            )
+                            or call.get(
+                                "method"
+                            )
+                            or ""
+                        )
+
+                        object_expression = (
+                            call.get(
+                                "object_expression"
+                            )
+                            or ""
+                        )
+
+                        if object_expression:
+
+                            call_display.append(
+                                f"{object_expression}."
+                                f"{method_called}"
+                            )
+
+                        else:
+
+                            call_display.append(
+                                str(
+                                    method_called
+                                )
+                            )
+
+                    else:
+
+                        call_display.append(
+                            str(call)
+                        )
+
                 calls_str = ", ".join(
-                    calls
+                    call_display
                 )
 
                 # -------------------------------------------------
@@ -175,8 +348,7 @@ class CodeChunker:
                 )
 
                 # -------------------------------------------------
-                # IMPORTANT:
-                # Store calls using the key "calls" and "relationships"
+                # Create chunk
                 # -------------------------------------------------
 
                 chunks.append({
@@ -231,9 +403,13 @@ class CodeChunker:
                     "text_representation":
                         text_repr,
 
+                    # IMPORTANT:
+                    # Preserve dictionaries here.
                     "calls":
                         calls,
 
+                    # Keep relationships compatible
+                    # with graph_builder.py.
                     "relationships":
                         calls
                 })
