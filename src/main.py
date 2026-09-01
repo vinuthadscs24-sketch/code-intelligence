@@ -1,15 +1,14 @@
-import os
 import shutil
-import tempfile
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any, Optional
+from collections import deque
+
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-# Import core engine modules
 from src.repo_utils import clone_repo_if_url
-from src.parser import JavaASTParser
+from src.multi_ast_parser import CodeParserFactory
 from src.chunker import CodeChunker
 from src.vector_store import VectorStore
 from src.graph_builder import CodeKnowledgeGraph
@@ -18,13 +17,25 @@ from src.context_builder import CodeIntelligenceContextBuilder
 from src.llm_engine import CodeIntelligenceEngine
 
 
+# =========================================================
+# FASTAPI APP
+# =========================================================
+
 app = FastAPI(
     title="AI Codebase Intelligence Engine",
-    description="REST API for Hybrid RRF Code Retrieval, Knowledge Graph Queries, Transitive Impact Analysis, and LLM Reasoning.",
-    version="1.0.0"
+    description=(
+        "REST API for Hybrid RRF Code Retrieval, "
+        "Knowledge Graph Queries, Impact Analysis, "
+        "Git Provenance and LLM Reasoning."
+    ),
+    version="1.0.0",
 )
 
-# Enable CORS for React/Tailwind frontend integration
+
+# =========================================================
+# CORS
+# =========================================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,143 +44,498 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global State Container
+
+# =========================================================
+# GLOBAL ENGINE STATE
+# =========================================================
+
 class EngineState:
-    repo_path: Optional[Path] = None
-    is_temp: bool = False
-    parser: Optional[JavaASTParser] = None
-    chunker: Optional[CodeChunker] = None
-    graph_db: Optional[CodeKnowledgeGraph] = None
-    vector_store: Optional[VectorStore] = None
-    git_intel: Optional[GitIntelligence] = None
-    context_builder: Optional[CodeIntelligenceContextBuilder] = None
-    engine: Optional[CodeIntelligenceEngine] = None
-    is_indexed: bool = False
+    def __init__(self):
+        self.repo_path: Optional[Path] = None
+        self.is_temp: bool = False
+        self.parser: Optional[Any] = None
+        self.chunker: Optional[CodeChunker] = None
+        self.graph_db: Optional[CodeKnowledgeGraph] = None
+        self.vector_store: Optional[VectorStore] = None
+        self.git_intel: Optional[GitIntelligence] = None
+        self.context_builder: Optional[
+            CodeIntelligenceContextBuilder
+        ] = None
+        self.engine: Optional[CodeIntelligenceEngine] = None
+        self.is_indexed: bool = False
 
 
 state = EngineState()
 
 
-# --- Request/Response Models ---
+# =========================================================
+# REQUEST MODELS
+# =========================================================
 
 class IndexRequest(BaseModel):
-    repo_path_or_url: Optional[str] = Field(None, example="https://github.com/spring-projects/spring-petclinic.git")
+    repo_path_or_url: Optional[str] = Field(
+        default=None,
+        example="https://github.com/user/repository.git",
+    )
+
     repo_url: Optional[str] = None
-    rebuild_index: bool = Field(False, description="Force rebuilding FAISS vector index")
+
+    rebuild_index: bool = Field(
+        default=False,
+        description="Force rebuilding the FAISS index.",
+    )
 
     @property
     def url(self) -> str:
         target = self.repo_path_or_url or self.repo_url
+
         if not target:
-            raise ValueError("Must provide either repo_path_or_url or repo_url.")
+            raise ValueError(
+                "Must provide either repo_path_or_url or repo_url."
+            )
+
         return target
 
 
 class QueryRequest(BaseModel):
-    question: Optional[str] = Field(None, example="How does user authentication work in this codebase?")
+    question: Optional[str] = Field(
+        default=None,
+        example="How does authentication work?",
+    )
+
     query: Optional[str] = None
-    top_k: int = Field(5, ge=1, le=20)
+
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+    )
+
     repo_id: Optional[str] = "default"
 
     @property
     def text(self) -> str:
         q = self.question or self.query
+
         if not q:
-            raise ValueError("Must provide either question or query field.")
+            raise ValueError(
+                "Must provide either question or query field."
+            )
+
         return q
 
 
 class ProvenanceRequest(BaseModel):
-    file: str = Field(..., example="src/main/java/com/example/UserService.java")
-    method: str = Field(..., example="createUser")
+    file: str
+    method: str
     start_line: int = Field(..., ge=1)
     end_line: int = Field(..., ge=1)
 
 
-# --- API Endpoints ---
+# =========================================================
+# HELPER FUNCTIONS
+# =========================================================
+
+def _normalise_graph_result(value):
+    """
+    Convert graph results into JSON-safe lists.
+
+    Handles lists, tuples, sets, dictionaries and None.
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, dict):
+        return value
+
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+
+    return [value]
+
+
+def _call_graph_method(graph, method_name: str, entity_name: str):
+    """
+    Safely call a graph method.
+
+    Some versions of graph_builder.py may return different
+    structures, so this wrapper keeps the API stable.
+    """
+    method = getattr(graph, method_name, None)
+
+    if method is None:
+        return []
+
+    try:
+        result = method(entity_name)
+        return _normalise_graph_result(result)
+    except TypeError:
+        return []
+    except Exception as exc:
+        print(
+            f"[Graph] {method_name} failed for "
+            f"{entity_name}: {exc}"
+        )
+        return []
+
+
+# =========================================================
+# HEALTH
+# =========================================================
 
 @app.get("/health")
 def health_check():
-    """Returns engine indexing and repository readiness status."""
     return {
         "status": "online",
         "indexed": state.is_indexed,
-        "repo_path": str(state.repo_path) if state.repo_path else None
+        "repo_path": (
+            str(state.repo_path)
+            if state.repo_path
+            else None
+        ),
     }
 
+
+# =========================================================
+# INDEX REPOSITORY
+# =========================================================
 
 @app.post("/api/repository/index")
 @app.post("/index")
 def index_repository(payload: IndexRequest):
-    """
-    Clones (if URL) or loads a local Java repository, parses ASTs, builds
-    the Knowledge Graph, and populates FAISS vector embeddings.
-    """
+
     try:
         target_url = payload.url
-        
-        # Clean up existing temporary repository if active
-        if state.is_temp and state.repo_path and state.repo_path.exists():
-            shutil.rmtree(state.repo_path, ignore_errors=True)
 
-        repo_path, is_temp = clone_repo_if_url(target_url)
-        if not repo_path.exists() or not repo_path.is_dir():
-            raise HTTPException(status_code=400, detail=f"Directory '{repo_path}' does not exist.")
+        print(
+            f"[Index] Starting repository indexing: "
+            f"{target_url}"
+        )
 
-        # 1. Parse AST
-        parser = JavaASTParser()
+        # -------------------------------------------------
+        # Cleanup previous temporary repository
+        # -------------------------------------------------
+
+        if (
+            state.is_temp
+            and state.repo_path
+            and state.repo_path.exists()
+        ):
+            print(
+                "[Index] Removing previous temporary repository..."
+            )
+
+            shutil.rmtree(
+                state.repo_path,
+                ignore_errors=True,
+            )
+
+        # -------------------------------------------------
+        # Reset state
+        # -------------------------------------------------
+
+        state.is_indexed = False
+        state.repo_path = None
+        state.graph_db = None
+        state.vector_store = None
+        state.git_intel = None
+        state.context_builder = None
+        state.engine = None
+
+        # -------------------------------------------------
+        # Clone / load repository
+        # -------------------------------------------------
+
+        repo_path, is_temp = clone_repo_if_url(
+            target_url
+        )
+
+        repo_path = Path(repo_path)
+
+        if not repo_path.exists():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Repository path does not exist: "
+                    f"{repo_path}"
+                ),
+            )
+
+        if not repo_path.is_dir():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Repository path is not a directory: "
+                    f"{repo_path}"
+                ),
+            )
+
+        print(
+            f"[Index] Repository path: {repo_path}"
+        )
+
+        # -------------------------------------------------
+        # Supported source extensions
+        # -------------------------------------------------
+
+        supported_extensions = {
+            ".java",
+            ".dart",
+            ".py",
+            ".js",
+            ".jsx",
+            ".ts",
+            ".tsx",
+            ".kt",
+            ".kts",
+        }
+
+        ignored_dirs = {
+            ".git",
+            ".idea",
+            ".vscode",
+            "node_modules",
+            "build",
+            ".dart_tool",
+            "__pycache__",
+            "venv",
+            ".venv",
+            "dist",
+            "target",
+            ".gradle",
+        }
+
+        # -------------------------------------------------
+        # Parse source files
+        # -------------------------------------------------
+
         extracted_data = []
-        for java_file in repo_path.rglob("*.java"):
-            if java_file.name in {"module-info.java", "package-info.java"}:
+
+        skipped_files = 0
+        parsed_files = 0
+
+        for source_file in repo_path.rglob("*"):
+
+            if not source_file.is_file():
                 continue
+
+            parts_lower = {
+                part.lower()
+                for part in source_file.parts
+            }
+
+            if parts_lower.intersection(ignored_dirs):
+                continue
+
+            extension = source_file.suffix.lower()
+
+            if extension not in supported_extensions:
+                continue
+
+            if source_file.name in {
+                "module-info.java",
+                "package-info.java",
+            }:
+                continue
+
+            # -------------------------------------------------
+            # Select parser
+            # -------------------------------------------------
+
+            parser = CodeParserFactory.get_parser(
+                str(source_file)
+            )
+
+            if parser is None:
+                skipped_files += 1
+                continue
+
             try:
-                result = parser.parse_file(str(java_file))
-                if result:
-                    if isinstance(result, dict):
-                        extracted_data.append((Path(java_file), result))
-                    elif isinstance(result, (tuple, list)):
-                        tree = result[0]
-                        source_code = result[1] if len(result) > 1 else ""
-                        symbols = parser.extract_symbols_and_relations(tree, source_code)
-                        extracted_data.append((Path(java_file), {
+
+                result = parser.parse_file(
+                    str(source_file)
+                )
+
+                if not result:
+                    skipped_files += 1
+                    continue
+
+                tree = result[0]
+
+                source_code = (
+                    result[1]
+                    if len(result) > 1
+                    else ""
+                )
+
+                if not source_code.strip():
+                    skipped_files += 1
+                    continue
+
+                symbols = (
+                    parser.extract_symbols_and_relations(
+                        tree,
+                        source_code,
+                    )
+                )
+
+                extracted_data.append(
+                    (
+                        Path(source_file),
+                        {
                             "tree": tree,
                             "source_code": source_code,
-                            "symbols": symbols
-                        }))
-            except Exception:
-                pass
+                            "symbols": symbols,
+                        },
+                    )
+                )
+
+                parsed_files += 1
+
+            except Exception as exc:
+
+                print(
+                    f"[Parser] Skipping "
+                    f"{source_file}: {exc}"
+                )
+
+                skipped_files += 1
+
+        print(
+            f"[Index] Parsed files: {parsed_files}"
+        )
+
+        print(
+            f"[Index] Skipped files: {skipped_files}"
+        )
 
         if not extracted_data:
-            raise HTTPException(status_code=400, detail="No valid Java files found or parsed.")
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No supported source files could be "
+                    "parsed from the repository."
+                ),
+            )
 
-        # 2. Chunking
-        chunker = CodeChunker(parser=parser)
-        chunks = chunker.create_chunks(extracted_data)
+        # -------------------------------------------------
+        # Chunking
+        # -------------------------------------------------
 
-        # 3. Knowledge Graph
+        print(
+            "[Index] Creating code chunks..."
+        )
+
+        chunker = CodeChunker()
+
+        chunks = chunker.create_chunks(
+            extracted_data
+        )
+
+        print(
+            f"[Index] Created {len(chunks)} chunks."
+        )
+
+        if not chunks:
+            raise HTTPException(
+                status_code=400,
+                detail="No code chunks were generated.",
+            )
+
+        # -------------------------------------------------
+        # Knowledge Graph
+        # -------------------------------------------------
+
+        print(
+            "[Index] Building knowledge graph..."
+        )
+
         kg = CodeKnowledgeGraph()
-        kg.build_graph_from_chunks(chunks)
 
-        # 4. Vector Store
+        kg.build_graph_from_chunks(
+            chunks
+        )
+
+        # -------------------------------------------------
+        # Vector Store
+        # -------------------------------------------------
+
+        print(
+            "[Index] Initializing vector store..."
+        )
+
         store = VectorStore()
-        if payload.rebuild_index or not store.load_index():
-            store.build_index(chunks)
+
+        index_loaded = False
+
+        if not payload.rebuild_index:
+            try:
+                index_loaded = store.load_index()
+            except Exception as exc:
+                print(
+                    f"[Index] Existing index could not "
+                    f"be loaded: {exc}"
+                )
+                index_loaded = False
+
+        if payload.rebuild_index or not index_loaded:
+
+            print(
+                "[Index] Building FAISS vector index..."
+            )
+
+            store.build_index(
+                chunks
+            )
+
             store.save_index()
 
-        # 5. Git & Context Engine
-        git_intel = GitIntelligence(repo_path=str(repo_path))
-        context_builder = CodeIntelligenceContextBuilder(git_intel=git_intel)
+        else:
+
+            print(
+                "[Index] Existing FAISS index loaded."
+            )
+
+        # -------------------------------------------------
+        # Git intelligence
+        # -------------------------------------------------
+
+        print(
+            "[Index] Initializing Git intelligence..."
+        )
+
+        git_intel = GitIntelligence(
+            repo_path=str(repo_path)
+        )
+
+        context_builder = (
+            CodeIntelligenceContextBuilder(
+                git_intel=git_intel
+            )
+        )
+
+        # -------------------------------------------------
+        # LLM engine
+        # -------------------------------------------------
+
+        print(
+            "[Index] Initializing LLM engine..."
+        )
+
         engine = CodeIntelligenceEngine(
             repo_path=str(repo_path),
             vector_store=store,
             graph_db=kg,
-            context_builder=context_builder
+            context_builder=context_builder,
         )
 
-        # Update State
+        # -------------------------------------------------
+        # Update global state
+        # -------------------------------------------------
+
         state.repo_path = repo_path
         state.is_temp = is_temp
-        state.parser = parser
+        state.parser = None
         state.chunker = chunker
         state.graph_db = kg
         state.vector_store = store
@@ -178,118 +544,382 @@ def index_repository(payload: IndexRequest):
         state.engine = engine
         state.is_indexed = True
 
-        summary = kg.get_summary()
+        # -------------------------------------------------
+        # Graph summary
+        # -------------------------------------------------
+
+        try:
+            summary = kg.get_summary()
+        except Exception as exc:
+            print(
+                f"[Index] Graph summary failed: {exc}"
+            )
+
+            summary = {
+                "total_nodes": 0,
+                "total_edges": 0,
+            }
+
         return {
             "status": "success",
             "message": "Repository indexed successfully.",
             "repoName": repo_path.name,
             "total_files": len(extracted_data),
             "total_chunks": len(chunks),
-            "graph_summary": summary
+            "graph_summary": summary,
         }
 
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Indexing failed: {str(e)}")
+    except HTTPException:
+        raise
 
+    except ValueError as exc:
+
+        state.is_indexed = False
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+
+        state.is_indexed = False
+
+        print(
+            f"[Index ERROR] "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Indexing failed: {str(exc)}",
+        )
+
+
+# =========================================================
+# QUERY
+# =========================================================
 
 @app.post("/api/query")
 @app.post("/ask")
-def query_codebase(payload: QueryRequest):
-    """
-    Unified end-to-end Q&A endpoint.
-    Performs Hybrid RRF search, builds contextual prompts, and queries LLM.
-    """
-    if not state.is_indexed or not state.engine:
-        raise HTTPException(status_code=400, detail="No repository indexed. Call POST /index first.")
+def query_codebase(
+    payload: QueryRequest,
+):
+
+    if (
+        not state.is_indexed
+        or not state.engine
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No repository indexed. "
+                "Call POST /index first."
+            ),
+        )
 
     try:
+
         q_text = payload.text
-        response = state.engine.answer_query(q_text, top_k=payload.top_k)
+
+        response = state.engine.answer_query(
+            q_text,
+            top_k=payload.top_k,
+        )
+
+        if isinstance(response, dict):
+
+            answer = response.get(
+                "answer",
+                "No response generated.",
+            )
+
+            retrieved_chunks = response.get(
+                "retrieved_chunks",
+                [],
+            )
+
+            context_used = response.get(
+                "context",
+                {},
+            )
+
+        else:
+
+            answer = str(response)
+
+            retrieved_chunks = []
+
+            context_used = {}
+
         return {
             "query": q_text,
-            "answer": response.get("answer", "No response generated."),
-            "retrieved_chunks": response.get("retrieved_chunks", []),
-            "context_used": response.get("context", {})
+            "answer": answer,
+            "retrieved_chunks": retrieved_chunks,
+            "context_used": context_used,
         }
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
+    except ValueError as exc:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+
+        print(
+            f"[Query ERROR] "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query failed: {str(exc)}",
+        )
+
+
+# =========================================================
+# DEPENDENCIES
+# =========================================================
 
 @app.get("/dependencies/{entity_name}")
-def get_entity_dependencies(entity_name: str):
-    """Retrieves callers, callees, and imports for a class or method entity."""
-    if not state.is_indexed or not state.graph_db:
-        raise HTTPException(status_code=400, detail="No repository indexed.")
+def get_entity_dependencies(
+    entity_name: str,
+):
 
-    callers = state.graph_db.get_callers(entity_name)
-    callees = state.graph_db.get_callees(entity_name)
+    if (
+        not state.is_indexed
+        or not state.graph_db
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="No repository indexed.",
+        )
 
-    return {
-        "entity": entity_name,
-        "callers": callers,
-        "callees": callees
-    }
+    try:
 
+        graph = state.graph_db
+
+        # -------------------------------------------------
+        # Callers
+        # -------------------------------------------------
+
+        callers = _call_graph_method(
+            graph,
+            "get_callers_of",
+            entity_name,
+        )
+
+        # -------------------------------------------------
+        # Callees
+        # -------------------------------------------------
+
+        callees = _call_graph_method(
+            graph,
+            "get_calls_from",
+            entity_name,
+        )
+
+        return {
+            "entity": entity_name,
+            "callers": callers,
+            "callees": callees,
+        }
+
+    except Exception as exc:
+
+        print(
+            f"[Dependencies ERROR] "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Dependency lookup failed: "
+                f"{str(exc)}"
+            ),
+        )
+
+
+# =========================================================
+# IMPACT ANALYSIS
+# =========================================================
 
 @app.get("/impact/{entity_name}")
 def get_impact_analysis(
-    entity_name: str, 
-    max_depth: int = Query(3, ge=1, le=5)
+    entity_name: str,
+    max_depth: int = Query(
+        default=3,
+        ge=1,
+        le=5,
+    ),
 ):
-    """Calculates multi-level transitive impact analysis using BFS across the Knowledge Graph."""
-    if not state.is_indexed or not state.graph_db:
-        raise HTTPException(status_code=400, detail="No repository indexed.")
 
-    from collections import deque
-    visited = {entity_name}
-    queue = deque([(entity_name, 0)])
-    affected_entities = []
-
-    while queue:
-        current_entity, distance = queue.popleft()
-        if distance >= max_depth:
-            continue
-
-        callers = state.graph_db.get_callers(current_entity)
-        for caller in callers:
-            if caller not in visited:
-                visited.add(caller)
-                affected_entities.append({
-                    "entity": caller,
-                    "distance": distance + 1
-                })
-                queue.append((caller, distance + 1))
-
-    return {
-        "target_entity": entity_name,
-        "max_depth": max_depth,
-        "total_affected": len(affected_entities),
-        "affected": affected_entities
-    }
-
-
-@app.post("/history/why-changed")
-def explain_method_provenance(payload: ProvenanceRequest):
-    """Explains why a specific method/line range changed using Git blame, show, and diff context."""
-    if not state.is_indexed or not state.engine:
-        raise HTTPException(status_code=400, detail="No repository indexed.")
+    if (
+        not state.is_indexed
+        or not state.graph_db
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="No repository indexed.",
+        )
 
     try:
-        response = state.engine.explain_why_changed(
-            file_path=payload.file,
-            method_name=payload.method,
-            start_line=payload.start_line,
-            end_line=payload.end_line
-        )
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Provenance lookup failed: {str(e)}")
 
+        graph = state.graph_db
+
+        visited = {
+            entity_name
+        }
+
+        queue = deque(
+            [
+                (
+                    entity_name,
+                    0,
+                )
+            ]
+        )
+
+        affected_entities = []
+
+        while queue:
+
+            current_entity, distance = (
+                queue.popleft()
+            )
+
+            if distance >= max_depth:
+                continue
+
+            callers = _call_graph_method(
+                graph,
+                "get_callers_of",
+                current_entity,
+            )
+
+            for caller in callers:
+
+                # Graph results may sometimes be dictionaries.
+                if isinstance(caller, dict):
+
+                    caller_name = (
+                        caller.get("name")
+                        or caller.get("entity")
+                        or caller.get("id")
+                    )
+
+                else:
+
+                    caller_name = str(caller)
+
+                if not caller_name:
+                    continue
+
+                if caller_name in visited:
+                    continue
+
+                visited.add(caller_name)
+
+                affected_entities.append(
+                    {
+                        "entity": caller_name,
+                        "distance": distance + 1,
+                    }
+                )
+
+                queue.append(
+                    (
+                        caller_name,
+                        distance + 1,
+                    )
+                )
+
+        return {
+            "target_entity": entity_name,
+            "max_depth": max_depth,
+            "total_affected": len(
+                affected_entities
+            ),
+            "affected": affected_entities,
+        }
+
+    except Exception as exc:
+
+        print(
+            f"[Impact ERROR] "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Impact analysis failed: "
+                f"{str(exc)}"
+            ),
+        )
+
+
+# =========================================================
+# GIT PROVENANCE
+# =========================================================
+
+@app.post("/history/why-changed")
+def explain_method_provenance(
+    payload: ProvenanceRequest,
+):
+
+    if (
+        not state.is_indexed
+        or not state.engine
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="No repository indexed.",
+        )
+
+    try:
+
+        response = (
+            state.engine.explain_why_changed(
+                file_path=payload.file,
+                method_name=payload.method,
+                start_line=payload.start_line,
+                end_line=payload.end_line,
+            )
+        )
+
+        return response
+
+    except Exception as exc:
+
+        print(
+            f"[Provenance ERROR] "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Provenance lookup failed: "
+                f"{str(exc)}"
+            ),
+        )
+
+
+# =========================================================
+# RUN DIRECTLY
+# =========================================================
 
 if __name__ == "__main__":
+
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+    uvicorn.run(
+        "src.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+    )
