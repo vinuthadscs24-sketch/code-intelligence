@@ -299,7 +299,7 @@ EMBEDDING_BATCH_SIZE = get_config_value(
 
 GENERATOR_MODEL_NAME = get_config_value(
     "generator.model_name",
-    "llama3",
+    "qwen2.5-coder:latest",
     "RAG_GENERATOR_MODEL_NAME"
 )
 
@@ -403,15 +403,6 @@ FAISS_INDEX_FILENAME = get_config_value(
     "vector_index.faiss"
 )
 
-# IMPORTANT:
-# Your existing repository currently has:
-#
-# data/indexes/my-test-repo/
-#     vector_index.faiss
-#     metadata.json
-#
-# Therefore FAISS currently uses metadata.json.
-
 FAISS_METADATA_FILENAME = get_config_value(
     "indexing.faiss.metadata_filename",
     "metadata.json"
@@ -427,15 +418,6 @@ BM25_INDEX_FILENAME = get_config_value(
     "bm25_index.pkl"
 )
 
-# IMPORTANT:
-# Your existing repository currently has:
-#
-# data/indexes/my-test-repo/
-#     bm25_index.pkl
-#     metadata.json
-#
-# Therefore BM25 also currently uses metadata.json.
-
 BM25_METADATA_FILENAME = get_config_value(
     "indexing.bm25.metadata_filename",
     "metadata.json"
@@ -448,13 +430,13 @@ BM25_METADATA_FILENAME = get_config_value(
 
 RETRIEVAL_VECTOR_TOP_K = get_config_value(
     "retrieval.vector_top_k",
-    20,
+    5,
     "RAG_RETRIEVAL_VECTOR_TOP_K"
 )
 
 RETRIEVAL_BM25_TOP_K = get_config_value(
     "retrieval.bm25_top_k",
-    5,
+    3,
     "RAG_RETRIEVAL_BM25_TOP_K"
 )
 

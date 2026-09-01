@@ -1,5 +1,8 @@
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Union
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class CodeChunker:
@@ -47,16 +50,19 @@ class CodeChunker:
             else ""
         )
 
+        if not source_code and isinstance(data, str):
+            source_code = data
+
         # ---------------------------------------------------------
         # Get extracted symbols
         # ---------------------------------------------------------
 
-        symbols = (
-            data
-            if isinstance(data, dict)
-            and "methods" in data
-            else data.get("symbols", {})
-        )
+        symbols = {}
+        if isinstance(data, dict):
+            if "methods" in data:
+                symbols = data
+            elif isinstance(data.get("symbols"), dict):
+                symbols = data["symbols"]
 
         if (
             not symbols
@@ -66,17 +72,22 @@ class CodeChunker:
                 "extract_symbols_and_relations"
             )
         ):
-            symbols = (
-                self.parser
-                .extract_symbols_and_relations(
-                    tree,
-                    source_code
+            try:
+                symbols = (
+                    self.parser
+                    .extract_symbols_and_relations(
+                        tree,
+                        source_code
+                    )
                 )
-            )
+            except Exception as e:
+                logger.warning(f"Could not extract symbols for {file_name}: {e}")
+                symbols = {}
 
-        methods = symbols.get(
-            "methods",
-            []
+        methods = (
+            symbols.get("methods", [])
+            if isinstance(symbols, dict)
+            else []
         )
 
         # ---------------------------------------------------------
@@ -107,13 +118,29 @@ class CodeChunker:
                     []
                 )
 
-                calls = method.get(
+                raw_calls = method.get(
                     "calls",
                     method.get(
                         "method_calls",
                         []
                     )
                 )
+
+                # -------------------------------------------------
+                # Normalize calls (Handles string or dict items)
+                # -------------------------------------------------
+
+                calls = []
+                if isinstance(raw_calls, list):
+                    for call in raw_calls:
+                        if isinstance(call, dict):
+                            c_name = call.get("method_called") or call.get("name")
+                            if c_name:
+                                calls.append(str(c_name))
+                        elif call:
+                            calls.append(str(call))
+                elif raw_calls:
+                    calls.append(str(raw_calls))
 
                 # -------------------------------------------------
                 # Normalize annotations
@@ -130,22 +157,6 @@ class CodeChunker:
                     ann_str = str(
                         annotations
                     )
-
-                # -------------------------------------------------
-                # Normalize calls
-                # -------------------------------------------------
-
-                if not isinstance(
-                    calls,
-                    list
-                ):
-                    calls = [str(calls)]
-
-                calls = [
-                    str(call)
-                    for call in calls
-                    if call
-                ]
 
                 calls_str = ", ".join(
                     calls
@@ -165,11 +176,7 @@ class CodeChunker:
 
                 # -------------------------------------------------
                 # IMPORTANT:
-                #
-                # We store calls using the key "calls".
-                #
-                # The graph builder and VectorStore both
-                # depend on this field.
+                # Store calls using the key "calls" and "relationships"
                 # -------------------------------------------------
 
                 chunks.append({
@@ -224,11 +231,9 @@ class CodeChunker:
                     "text_representation":
                         text_repr,
 
-                    # FIX
                     "calls":
                         calls,
 
-                    # Keep this for compatibility
                     "relationships":
                         calls
                 })
