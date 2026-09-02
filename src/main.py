@@ -15,6 +15,8 @@ from src.graph_builder import CodeKnowledgeGraph
 from src.git_intelligence import GitIntelligence
 from src.context_builder import CodeIntelligenceContextBuilder
 from src.llm_engine import CodeIntelligenceEngine
+from src.query_router import QueryRouter, QueryIntent
+from src.structured_response import StructuredResponse
 
 
 # =========================================================
@@ -62,6 +64,10 @@ class EngineState:
             CodeIntelligenceContextBuilder
         ] = None
         self.engine: Optional[CodeIntelligenceEngine] = None
+
+        # Adaptive response routing
+        self.query_router = QueryRouter()
+
         self.is_indexed: bool = False
 
 
@@ -716,11 +722,514 @@ def index_repository(
 
 
 # =========================================================
-# QUERY
+# ADAPTIVE QUERY RESPONSE
 # =========================================================
 
-@app.post("/api/query")
-@app.post("/ask")
+
+def _safe_name(value: Any) -> str:
+    """
+    Convert graph values into a stable display name.
+    """
+    if isinstance(value, dict):
+        return (
+            value.get("name")
+            or value.get("entity")
+            or value.get("id")
+            or value.get("method")
+            or str(value)
+        )
+
+    return str(value)
+
+
+def _build_call_graph_response(
+    query: str,
+    target: str,
+) -> StructuredResponse:
+    """Build a structured call-graph response using the knowledge graph."""
+
+    graph = state.graph_db
+
+    if not graph:
+        return StructuredResponse(
+            query=query,
+            response_type=QueryIntent.CALL_GRAPH.value,
+            answer="Knowledge graph is not available.",
+            data={},
+            evidence=[],
+        )
+
+    callers = _call_graph_method(
+        graph,
+        "get_callers_of",
+        target,
+    )
+
+    callees = _call_graph_method(
+        graph,
+        "get_calls_from",
+        target,
+    )
+
+    nodes = [
+        {
+            "id": target,
+            "label": target,
+            "type": "method",
+        }
+    ]
+
+    edges = []
+
+    for caller in callers:
+        caller_name = _safe_name(caller)
+        if not caller_name:
+            continue
+
+        nodes.append(
+            {
+                "id": caller_name,
+                "label": caller_name,
+                "type": "method",
+            }
+        )
+
+        edges.append(
+            {
+                "source": caller_name,
+                "target": target,
+                "type": "CALLS",
+            }
+        )
+
+    for callee in callees:
+        callee_name = _safe_name(callee)
+        if not callee_name:
+            continue
+
+        nodes.append(
+            {
+                "id": callee_name,
+                "label": callee_name,
+                "type": "method",
+            }
+        )
+
+        edges.append(
+            {
+                "source": target,
+                "target": callee_name,
+                "type": "CALLS",
+            }
+        )
+
+    unique_nodes = {}
+    for node in nodes:
+        unique_nodes[node["id"]] = node
+
+    unique_edges = []
+    seen_edges = set()
+
+    for edge in edges:
+        edge_key = (
+            edge["source"],
+            edge["target"],
+            edge["type"],
+        )
+
+        if edge_key in seen_edges:
+            continue
+
+        seen_edges.add(edge_key)
+        unique_edges.append(edge)
+
+    if callers and callees:
+        answer = (
+            f"{target} is called by {len(callers)} method(s) "
+            f"and calls {len(callees)} method(s)."
+        )
+    elif callers:
+        answer = f"{target} is called by {len(callers)} method(s)."
+    elif callees:
+        answer = f"{target} calls {len(callees)} method(s)."
+    else:
+        answer = (
+            f"No direct caller or callee relationships were found "
+            f"for {target}."
+        )
+
+    return StructuredResponse(
+        query=query,
+        response_type=QueryIntent.CALL_GRAPH.value,
+        answer=answer,
+        data={
+            "target": target,
+            "nodes": list(unique_nodes.values()),
+            "edges": unique_edges,
+            "callers": [_safe_name(caller) for caller in callers],
+            "callees": [_safe_name(callee) for callee in callees],
+        },
+        evidence=[],
+    )
+
+
+def _build_impact_response(
+    query: str,
+    target: str,
+) -> StructuredResponse:
+    """Build a structured impact-analysis response."""
+
+    graph = state.graph_db
+
+    if not graph:
+        return StructuredResponse(
+            query=query,
+            response_type=QueryIntent.IMPACT.value,
+            answer="Knowledge graph is not available.",
+            data={},
+            evidence=[],
+        )
+
+    max_depth = 3
+    visited = {target}
+    queue = deque([(target, 0)])
+    affected_entities = []
+
+    while queue:
+        current_entity, distance = queue.popleft()
+
+        if distance >= max_depth:
+            continue
+
+        callers = _call_graph_method(
+            graph,
+            "get_callers_of",
+            current_entity,
+        )
+
+        for caller in callers:
+            caller_name = _safe_name(caller)
+
+            if not caller_name or caller_name in visited:
+                continue
+
+            visited.add(caller_name)
+            next_distance = distance + 1
+
+            affected_entities.append(
+                {
+                    "entity": caller_name,
+                    "distance": next_distance,
+                }
+            )
+
+            queue.append((caller_name, next_distance))
+
+    return StructuredResponse(
+        query=query,
+        response_type=QueryIntent.IMPACT.value,
+        answer=(
+            f"Changing {target} could directly or indirectly affect "
+            f"{len(affected_entities)} method(s) within "
+            f"{max_depth} call level(s)."
+        ),
+        data={
+            "target": target,
+            "max_depth": max_depth,
+            "affected": affected_entities,
+        },
+        evidence=[],
+    )
+
+
+def _run_rag_response(
+    query: str,
+    top_k: int,
+):
+    """Run the existing RAG engine without changing its behavior."""
+
+    response = state.engine.answer_query(
+        query,
+        top_k=top_k,
+    )
+
+    if isinstance(response, dict):
+        answer = response.get(
+            "answer",
+            "No response generated.",
+        )
+        retrieved_chunks = response.get(
+            "retrieved_chunks",
+            [],
+        )
+        context_used = response.get(
+            "context",
+            {},
+        )
+    else:
+        answer = str(response)
+        retrieved_chunks = []
+        context_used = {}
+
+    return answer, retrieved_chunks, context_used
+
+
+def _build_retrieval_trace_response(
+    query: str,
+    top_k: int,
+) -> StructuredResponse:
+    """Return the normal RAG answer plus retrieval evidence."""
+
+    answer, retrieved_chunks, context_used = _run_rag_response(
+        query,
+        top_k,
+    )
+
+    evidence = (
+        retrieved_chunks
+        if isinstance(retrieved_chunks, list)
+        else []
+    )
+
+    return StructuredResponse(
+        query=query,
+        response_type=QueryIntent.RETRIEVAL_TRACE.value,
+        answer=answer,
+        data={
+            "retrieved_chunks": retrieved_chunks,
+            "context_used": context_used,
+        },
+        evidence=evidence,
+    )
+
+
+def _build_standard_answer_response(
+    query: str,
+    top_k: int,
+) -> StructuredResponse:
+    """Preserve the existing RAG answer behavior."""
+
+    answer, retrieved_chunks, context_used = _run_rag_response(
+        query,
+        top_k,
+    )
+
+    evidence = (
+        retrieved_chunks
+        if isinstance(retrieved_chunks, list)
+        else []
+    )
+
+    return StructuredResponse(
+        query=query,
+        response_type=QueryIntent.ANSWER.value,
+        answer=answer,
+        data={
+            "retrieved_chunks": retrieved_chunks,
+            "context_used": context_used,
+        },
+        evidence=evidence,
+    )
+
+
+def _build_git_history_response(
+    query: str,
+    target: Optional[str],
+    top_k: int,
+) -> StructuredResponse:
+    """
+    Preserve the existing Git/RAG reasoning behavior while exposing
+    the response through the structured response contract.
+    """
+
+    answer, retrieved_chunks, context_used = _run_rag_response(
+        query,
+        top_k,
+    )
+
+    evidence = (
+        retrieved_chunks
+        if isinstance(retrieved_chunks, list)
+        else []
+    )
+
+    return StructuredResponse(
+        query=query,
+        response_type=QueryIntent.GIT_HISTORY.value,
+        answer=answer,
+        data={
+            "target": target,
+            "retrieved_chunks": retrieved_chunks,
+            "context_used": context_used,
+        },
+        evidence=evidence,
+    )
+
+
+def _build_flow_response(
+    query: str,
+    target: Optional[str],
+    top_k: int,
+) -> StructuredResponse:
+    """
+    Build a flow response from actual graph relationships.
+
+    For a generic flow question with no explicit target, the existing
+    RAG engine is used to preserve semantic/business-flow reasoning.
+    For a targeted flow question, direct graph caller/callee edges are
+    exposed as structured steps and edges.
+    """
+
+    graph = state.graph_db
+
+    if not graph:
+        return StructuredResponse(
+            query=query,
+            response_type=QueryIntent.FLOW.value,
+            answer="Knowledge graph is not available.",
+            data={},
+            evidence=[],
+        )
+
+    # ---------------------------------------------------------
+    # Generic flow question
+    # ---------------------------------------------------------
+
+    if not target:
+        answer, retrieved_chunks, context_used = _run_rag_response(
+            query,
+            top_k,
+        )
+
+        evidence = (
+            retrieved_chunks
+            if isinstance(retrieved_chunks, list)
+            else []
+        )
+
+        return StructuredResponse(
+            query=query,
+            response_type=QueryIntent.FLOW.value,
+            answer=answer,
+            data={
+                "steps": [],
+                "edges": [],
+                "mode": "semantic",
+                "context_used": context_used,
+            },
+            evidence=evidence,
+        )
+
+    # ---------------------------------------------------------
+    # Targeted flow question
+    # ---------------------------------------------------------
+
+    steps = [
+        {
+            "id": target,
+            "label": target,
+            "type": "method",
+        }
+    ]
+
+    edges = []
+
+    callers = _call_graph_method(
+        graph,
+        "get_callers_of",
+        target,
+    )
+
+    callees = _call_graph_method(
+        graph,
+        "get_calls_from",
+        target,
+    )
+
+    for caller in callers:
+        caller_name = _safe_name(caller)
+        if not caller_name:
+            continue
+
+        steps.append(
+            {
+                "id": caller_name,
+                "label": caller_name,
+                "type": "method",
+            }
+        )
+
+        edges.append(
+            {
+                "source": caller_name,
+                "target": target,
+                "type": "CALLS",
+            }
+        )
+
+    for callee in callees:
+        callee_name = _safe_name(callee)
+        if not callee_name:
+            continue
+
+        steps.append(
+            {
+                "id": callee_name,
+                "label": callee_name,
+                "type": "method",
+            }
+        )
+
+        edges.append(
+            {
+                "source": target,
+                "target": callee_name,
+                "type": "CALLS",
+            }
+        )
+
+    unique_steps = {}
+    for step in steps:
+        unique_steps[step["id"]] = step
+
+    unique_edges = []
+    seen_edges = set()
+
+    for edge in edges:
+        edge_key = (
+            edge["source"],
+            edge["target"],
+            edge["type"],
+        )
+
+        if edge_key in seen_edges:
+            continue
+
+        seen_edges.add(edge_key)
+        unique_edges.append(edge)
+
+    answer = (
+        f"The flow around {target} contains "
+        f"{len(unique_steps)} connected method(s) "
+        f"through direct caller/callee relationships."
+    )
+
+    return StructuredResponse(
+        query=query,
+        response_type=QueryIntent.FLOW.value,
+        answer=answer,
+        data={
+            "target": target,
+            "steps": list(unique_steps.values()),
+            "edges": unique_edges,
+            "mode": "graph",
+        },
+        evidence=[],
+    )
+
+
+@app.post("/api/query", response_model=StructuredResponse)
+@app.post("/ask", response_model=StructuredResponse)
 def query_codebase(
     payload: QueryRequest,
 ):
@@ -742,49 +1251,82 @@ def query_codebase(
 
         q_text = payload.text
 
-        response = (
-            state.engine.answer_query(
-                q_text,
-                top_k=payload.top_k,
-            )
+        # -----------------------------------------------------
+        # 1. Route the query by intent
+        # -----------------------------------------------------
+
+        route = state.query_router.route(q_text)
+
+        print(
+            f"[Query Router] intent={route.intent.value} "
+            f"target={route.target}"
         )
 
-        if isinstance(
-            response,
-            dict,
-        ):
+        # -----------------------------------------------------
+        # 2. Build the appropriate structured response
+        # -----------------------------------------------------
 
-            answer = response.get(
-                "answer",
-                "No response generated.",
+        if route.intent == QueryIntent.CALL_GRAPH:
+
+            if route.target:
+                result = _build_call_graph_response(
+                    q_text,
+                    route.target,
+                )
+            else:
+                result = _build_standard_answer_response(
+                    q_text,
+                    payload.top_k,
+                )
+
+        elif route.intent == QueryIntent.IMPACT:
+
+            if route.target:
+                result = _build_impact_response(
+                    q_text,
+                    route.target,
+                )
+            else:
+                result = _build_standard_answer_response(
+                    q_text,
+                    payload.top_k,
+                )
+
+        elif route.intent == QueryIntent.GIT_HISTORY:
+
+            result = _build_git_history_response(
+                q_text,
+                route.target,
+                payload.top_k,
             )
 
-            retrieved_chunks = response.get(
-                "retrieved_chunks",
-                [],
+        elif route.intent == QueryIntent.FLOW:
+
+            result = _build_flow_response(
+                q_text,
+                route.target,
+                payload.top_k,
             )
 
-            context_used = response.get(
-                "context",
-                {},
+        elif route.intent == QueryIntent.RETRIEVAL_TRACE:
+
+            result = _build_retrieval_trace_response(
+                q_text,
+                payload.top_k,
             )
 
         else:
 
-            answer = str(
-                response
+            result = _build_standard_answer_response(
+                q_text,
+                payload.top_k,
             )
 
-            retrieved_chunks = []
+        # -----------------------------------------------------
+        # 3. Return the Pydantic structured response
+        # -----------------------------------------------------
 
-            context_used = {}
-
-        return {
-            "query": q_text,
-            "answer": answer,
-            "retrieved_chunks": retrieved_chunks,
-            "context_used": context_used,
-        }
+        return result
 
     except ValueError as exc:
 
