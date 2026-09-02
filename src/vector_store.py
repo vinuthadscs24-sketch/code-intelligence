@@ -2,7 +2,7 @@ import os
 import pickle
 import time
 import logging
-from typing import List, Dict, Any, Union
+from typing import Any, Dict, List, Optional
 
 import requests
 import faiss
@@ -14,67 +14,57 @@ logger = logging.getLogger(__name__)
 
 class VectorStore:
     """
-    FAISS vector store using Ollama's nomic-embed-text embeddings.
+    FAISS-based vector store using Ollama embeddings.
 
-    Ollama:
-        http://localhost:11434
-
-    Embedding model:
+    Default embedding model:
         nomic-embed-text
 
-    Expected embedding dimension:
+    Default embedding dimension:
         768
-
-    Important:
-        nomic-embed-text is running with a limited context window,
-        so code sent for embedding is intentionally kept compact.
     """
 
     def __init__(
         self,
-        model_name: str = "nomic-embed-text",
         ollama_url: str = "http://localhost:11434",
+        model_name: str = "nomic-embed-text",
+        dimension: int = 768,
+        index_dir: str = "data/indexes",
     ):
-        self.model_name = model_name
         self.ollama_url = ollama_url.rstrip("/")
+        self.model_name = model_name
+        self.dimension = dimension
+        self.index_dir = index_dir
+
+        # IMPORTANT:
+        # Keep the final embedding text safely below the
+        # Ollama model context length.
+        #
+        # This is a CHARACTER limit, not a token limit.
+        # 1200 chars is intentionally conservative.
+        self.max_embedding_chars = 1200
 
         self.embedding_url = (
             f"{self.ollama_url}/api/embeddings"
         )
 
-        # nomic-embed-text produces 768-dimensional vectors
-        self.dimension = 768
-
-        # Keep embedding input safely below Ollama's
-        # 2048-token context window.
-        #
-        # This is CHARACTER based, not token based.
-        self.max_embedding_chars = 2000
-
-        # Retry configuration
         self.max_retries = 3
         self.retry_delay = 1.5
 
-        # FAISS inner-product index.
-        # Vectors are L2-normalized before insertion,
-        # therefore inner product behaves as cosine similarity.
-        self.index = faiss.IndexFlatIP(
-            self.dimension
-        )
-
-        # Metadata corresponding to FAISS vectors
+        self.index: Optional[faiss.Index] = None
         self.chunks: List[Dict[str, Any]] = []
 
-        self._check_ollama()
+        os.makedirs(
+            self.index_dir,
+            exist_ok=True,
+        )
 
     # ============================================================
     # OLLAMA
     # ============================================================
 
-    def _check_ollama(self):
+    def _check_ollama(self) -> bool:
         """
-        Check whether Ollama is running and the embedding
-        model is installed.
+        Check whether Ollama is running and reachable.
         """
 
         try:
@@ -85,50 +75,19 @@ class VectorStore:
 
             response.raise_for_status()
 
-            data = response.json()
+            return True
 
-            models = data.get(
-                "models",
-                []
+        except requests.RequestException as exc:
+
+            logger.error(
+                "Ollama is not reachable: %s",
+                exc,
             )
 
-            model_names = [
-                str(model.get("name", ""))
-                for model in models
-            ]
-
-            model_available = any(
-                name == self.model_name
-                or name.startswith(
-                    f"{self.model_name}:"
-                )
-                for name in model_names
-            )
-
-            if not model_available:
-
-                raise RuntimeError(
-                    f"Ollama model '{self.model_name}' "
-                    f"is not installed.\n\n"
-                    f"Run:\n"
-                    f"ollama pull {self.model_name}"
-                )
-
-            print(
-                "[VectorStore] Ollama connected. "
-                f"Embedding model: {self.model_name}"
-            )
-
-        except requests.RequestException as e:
-
-            raise RuntimeError(
-                "Could not connect to Ollama at "
-                f"{self.ollama_url}.\n"
-                "Make sure Ollama is running."
-            ) from e
+            return False
 
     # ============================================================
-    # TEXT PREPARATION
+    # SAFE STRING
     # ============================================================
 
     def _safe_string(
@@ -136,20 +95,43 @@ class VectorStore:
         value: Any,
     ) -> str:
         """
-        Convert arbitrary values to strings safely.
+        Convert arbitrary values into safe strings.
         """
 
         if value is None:
             return ""
 
+        if isinstance(value, str):
+            return value
+
         if isinstance(value, list):
 
-            return " ".join(
-                str(item)
-                for item in value
-            )
+            parts = []
+
+            for item in value:
+
+                if isinstance(item, dict):
+
+                    parts.append(
+                        str(item)
+                    )
+
+                else:
+
+                    parts.append(
+                        str(item)
+                    )
+
+            return ", ".join(parts)
+
+        if isinstance(value, dict):
+            return str(value)
 
         return str(value)
+
+    # ============================================================
+    # BUILD EMBEDDING TEXT
+    # ============================================================
 
     def _build_text_representation(
         self,
@@ -158,62 +140,55 @@ class VectorStore:
         """
         Build a compact semantic representation of a code chunk.
 
-        IMPORTANT:
+        The returned text is ALWAYS capped at
+        self.max_embedding_chars.
 
-        We preserve metadata such as:
+        Important design decisions:
 
-            class
-            method
-            signature
-            annotations
-            calls
-
-        and truncate ONLY the code.
-
-        This is better than blindly truncating the complete
-        representation because metadata is highly valuable
-        for semantic retrieval.
+        1. Structural metadata is preserved.
+        2. Calls are represented compactly.
+        3. Complete call dictionaries are NOT dumped into the
+           embedding text.
+        4. Code is truncated first.
+        5. Metadata is progressively shortened if necessary.
+        6. A final hard safety limit is always applied.
         """
 
         # --------------------------------------------------------
-        # Basic metadata
+        # BASIC METADATA
         # --------------------------------------------------------
 
         chunk_type = self._safe_string(
             chunk.get(
                 "chunk_type",
-                "METHOD"
+                "METHOD",
             )
         )
 
         class_name = self._safe_string(
             chunk.get(
                 "class_name",
-                ""
+                "",
             )
         )
 
         method_name = self._safe_string(
             chunk.get(
                 "method_name",
-                ""
+                "",
             )
         )
 
         signature = self._safe_string(
             chunk.get(
                 "signature",
-                ""
+                "",
             )
         )
 
-        # --------------------------------------------------------
-        # Annotations
-        # --------------------------------------------------------
-
         annotations_value = chunk.get(
             "annotations",
-            []
+            [],
         )
 
         annotations = self._safe_string(
@@ -221,26 +196,115 @@ class VectorStore:
         )
 
         # --------------------------------------------------------
-        # Calls
+        # COMPACT CALL INFORMATION
         # --------------------------------------------------------
 
         calls_value = chunk.get(
             "calls",
-            []
+            [],
         )
 
-        calls = self._safe_string(
-            calls_value
+        call_names: List[str] = []
+
+        if isinstance(
+            calls_value,
+            list,
+        ):
+
+            for call in calls_value:
+
+                if isinstance(
+                    call,
+                    dict,
+                ):
+
+                    method_called = str(
+                        call.get(
+                            "method_called",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
+                    object_expression = str(
+                        call.get(
+                            "object_expression",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
+                    if (
+                        object_expression
+                        and method_called
+                    ):
+
+                        call_names.append(
+                            f"{object_expression}.{method_called}"
+                        )
+
+                    elif method_called:
+
+                        call_names.append(
+                            method_called
+                        )
+
+                    else:
+
+                        target_method = str(
+                            call.get(
+                                "target_method",
+                                "",
+                            )
+                            or ""
+                        ).strip()
+
+                        if target_method:
+                            call_names.append(
+                                target_method
+                            )
+
+                else:
+
+                    value = str(
+                        call
+                    ).strip()
+
+                    if value:
+                        call_names.append(
+                            value
+                        )
+
+        else:
+
+            calls_string = self._safe_string(
+                calls_value
+            )
+
+            if calls_string:
+                call_names.append(
+                    calls_string
+                )
+
+        # Remove duplicates while preserving order.
+        call_names = list(
+            dict.fromkeys(
+                call_names
+            )
+        )
+
+        calls = ", ".join(
+            call_names
         )
 
         # --------------------------------------------------------
-        # Source/code
+        # CODE
         # --------------------------------------------------------
 
         code = self._safe_string(
             chunk.get(
                 "code_content",
-                ""
+                "",
             )
         )
 
@@ -249,15 +313,24 @@ class VectorStore:
             code = self._safe_string(
                 chunk.get(
                     "source_code",
-                    ""
+                    "",
                 )
             )
 
         # --------------------------------------------------------
-        # Metadata comes first.
-        #
-        # This ensures important semantic information remains
-        # even when code needs to be shortened.
+        # HARD LIMIT
+        # --------------------------------------------------------
+
+        limit = int(
+            self.max_embedding_chars
+        )
+
+        if limit <= 0:
+
+            limit = 1200
+
+        # --------------------------------------------------------
+        # FIRST METADATA VERSION
         # --------------------------------------------------------
 
         metadata = (
@@ -271,51 +344,136 @@ class VectorStore:
         )
 
         # --------------------------------------------------------
-        # Calculate how much code we can keep.
+        # IF METADATA IS TOO LARGE
+        # --------------------------------------------------------
+
+        if len(metadata) >= limit:
+
+            compact_calls = calls
+
+            if len(
+                compact_calls
+            ) > 300:
+
+                compact_calls = (
+                    compact_calls[:300]
+                    + "..."
+                )
+
+            compact_annotations = annotations
+
+            if len(
+                compact_annotations
+            ) > 150:
+
+                compact_annotations = (
+                    compact_annotations[:150]
+                    + "..."
+                )
+
+            compact_signature = signature
+
+            if len(
+                compact_signature
+            ) > 250:
+
+                compact_signature = (
+                    compact_signature[:250]
+                    + "..."
+                )
+
+            metadata = (
+                f"Type: {chunk_type}\n"
+                f"Class: {class_name}\n"
+                f"Method: {method_name}\n"
+                f"Signature: {compact_signature}\n"
+                f"Annotations: {compact_annotations}\n"
+                f"Calls: {compact_calls}\n"
+                f"Code:\n"
+            )
+
+        # --------------------------------------------------------
+        # SECONDARY METADATA FALLBACK
+        # --------------------------------------------------------
+
+        if len(metadata) >= limit:
+
+            metadata = (
+                f"Type: {chunk_type}\n"
+                f"Class: {class_name}\n"
+                f"Method: {method_name}\n"
+                f"Signature: {signature[:200]}\n"
+                f"Calls: {calls[:250]}\n"
+                f"Code:\n"
+            )
+
+        # --------------------------------------------------------
+        # FINAL METADATA SAFETY
+        # --------------------------------------------------------
+
+        if len(metadata) >= limit:
+
+            metadata = (
+                f"Type: {chunk_type}\n"
+                f"Class: {class_name}\n"
+                f"Method: {method_name}\n"
+                f"Code:\n"
+            )
+
+        # --------------------------------------------------------
+        # CALCULATE SPACE AVAILABLE FOR CODE
         # --------------------------------------------------------
 
         available_code_chars = (
-            self.max_embedding_chars
-            - len(metadata)
+            limit - len(metadata)
         )
 
-        # Always leave at least a small amount for code.
-        if available_code_chars < 200:
+        if available_code_chars < 0:
 
-            available_code_chars = 200
+            available_code_chars = 0
 
         # --------------------------------------------------------
-        # Truncate ONLY code.
+        # TRUNCATE CODE
         # --------------------------------------------------------
 
         if len(code) > available_code_chars:
 
-            print(
-                "[VectorStore] Truncating code for "
-                f"{class_name}.{method_name}: "
-                f"{len(code)} -> "
-                f"{available_code_chars} chars"
-            )
+            if available_code_chars > 40:
 
-            code = code[
-                :available_code_chars
-            ]
+                code = (
+                    code[
+                        : available_code_chars - 40
+                    ]
+                    + "\n// [code truncated]"
+                )
 
-            code += "\n// [code truncated for embedding]"
+            else:
+
+                code = code[
+                    :available_code_chars
+                ]
 
         # --------------------------------------------------------
-        # Final representation
+        # FINAL TEXT
         # --------------------------------------------------------
 
         text = (
             metadata
             + code
-        )
+        ).strip()
 
-        return text.strip()
+        # --------------------------------------------------------
+        # ABSOLUTE FINAL SAFETY GUARD
+        # --------------------------------------------------------
+
+        if len(text) > limit:
+
+            text = text[:limit]
+
+        return text
 
     # ============================================================
-    # EMBEDDING
+    # SINGLE EMBEDDING
     # ============================================================
 
     def _generate_single_embedding(
@@ -324,221 +482,213 @@ class VectorStore:
     ) -> List[float]:
         """
         Generate one embedding using Ollama.
+
+        The text is hard-capped before being sent to Ollama.
         """
 
-        response = requests.post(
-            self.embedding_url,
-            json={
-                "model": self.model_name,
-                "prompt": text,
-            },
-            timeout=180,
-        )
-
-        # Handle HTTP errors ourselves so the message is clearer.
-        if response.status_code != 200:
-
-            try:
-                error_data = response.json()
-
-                error_message = (
-                    error_data.get(
-                        "error",
-                        response.text
-                    )
-                )
-
-            except Exception:
-
-                error_message = response.text
-
-            raise RuntimeError(
-                f"Ollama HTTP {response.status_code}: "
-                f"{error_message}"
-            )
-
-        try:
-
-            data = response.json()
-
-        except Exception as e:
-
-            raise RuntimeError(
-                "Ollama returned an invalid JSON response."
-            ) from e
-
-        if "embedding" not in data:
-
-            raise RuntimeError(
-                "Ollama response does not contain "
-                f"'embedding': {data}"
-            )
-
-        embedding = data["embedding"]
-
         if not isinstance(
-            embedding,
-            list
+            text,
+            str,
         ):
 
-            raise RuntimeError(
-                "Ollama embedding is not a list."
+            text = str(text)
+
+        # Absolute safety guard.
+        text = text[
+            : self.max_embedding_chars
+        ]
+
+        if not text.strip():
+
+            raise ValueError(
+                "Cannot generate embedding for empty text."
             )
 
-        if len(embedding) != self.dimension:
+        payload = {
+            "model": self.model_name,
+            "prompt": text,
+        }
 
-            raise RuntimeError(
-                "Unexpected embedding dimension: "
-                f"{len(embedding)}. "
-                f"Expected {self.dimension}."
-            )
+        last_error = None
 
-        return embedding
+        for attempt in range(
+            1,
+            self.max_retries + 1,
+        ):
+
+            try:
+
+                response = requests.post(
+                    self.embedding_url,
+                    json=payload,
+                    timeout=120,
+                )
+
+                if not response.ok:
+
+                    try:
+                        error_data = (
+                            response.json()
+                        )
+
+                        error_message = (
+                            error_data.get(
+                                "error",
+                                response.text,
+                            )
+                        )
+
+                    except Exception:
+
+                        error_message = (
+                            response.text
+                        )
+
+                    raise RuntimeError(
+                        "Ollama HTTP "
+                        f"{response.status_code}: "
+                        f"{error_message}"
+                    )
+
+                data = response.json()
+
+                embedding = data.get(
+                    "embedding"
+                )
+
+                if not embedding:
+
+                    raise RuntimeError(
+                        "Ollama response did not "
+                        "contain an embedding."
+                    )
+
+                embedding = [
+                    float(value)
+                    for value in embedding
+                ]
+
+                if len(embedding) != self.dimension:
+
+                    raise RuntimeError(
+                        "Embedding dimension mismatch. "
+                        f"Expected {self.dimension}, "
+                        f"got {len(embedding)}."
+                    )
+
+                return embedding
+
+            except Exception as exc:
+
+                last_error = exc
+
+                logger.warning(
+                    "Embedding attempt %s/%s failed: %s",
+                    attempt,
+                    self.max_retries,
+                    exc,
+                )
+
+                if attempt < self.max_retries:
+
+                    time.sleep(
+                        self.retry_delay
+                    )
+
+        raise RuntimeError(
+            "Failed to generate embedding "
+            f"after {self.max_retries} attempts: "
+            f"{last_error}"
+        )
+
+    # ============================================================
+    # EMBED MULTIPLE TEXTS
+    # ============================================================
 
     def _embed(
         self,
-        texts: Union[
-            str,
-            List[str]
-        ],
-        batch_size: int = 8,
+        texts: List[str],
     ) -> np.ndarray:
         """
-        Generate embeddings for multiple texts.
-
-        Ollama's /api/embeddings endpoint is called once
-        per text.
-
-        batch_size controls progress logging only.
+        Generate embeddings for a list of texts.
         """
-
-        if isinstance(
-            texts,
-            str
-        ):
-
-            texts = [texts]
 
         if not texts:
 
             return np.empty(
-                (0, self.dimension),
-                dtype="float32"
+                (
+                    0,
+                    self.dimension,
+                ),
+                dtype=np.float32,
             )
 
         embeddings = []
 
         total = len(texts)
 
-        print(
-            "[VectorStore] Generating Ollama "
-            f"embeddings for {total} chunks..."
-        )
-
-        for i, text in enumerate(
+        for index, text in enumerate(
             texts,
-            start=1
+            start=1,
         ):
 
-            last_error = None
+            try:
 
-            for attempt in range(
-                1,
-                self.max_retries + 1
-            ):
-
-                try:
-
-                    embedding = (
-                        self._generate_single_embedding(
-                            text
-                        )
+                embedding = (
+                    self._generate_single_embedding(
+                        text
                     )
-
-                    embeddings.append(
-                        embedding
-                    )
-
-                    break
-
-                except Exception as e:
-
-                    last_error = e
-
-                    print(
-                        "[VectorStore] Embedding "
-                        f"{i}/{total} failed "
-                        f"(attempt "
-                        f"{attempt}/"
-                        f"{self.max_retries}): "
-                        f"{e}"
-                    )
-
-                    if attempt < self.max_retries:
-
-                        time.sleep(
-                            self.retry_delay
-                        )
-
-            else:
-
-                raise RuntimeError(
-                    f"Failed to generate embedding "
-                    f"{i}/{total} after "
-                    f"{self.max_retries} attempts: "
-                    f"{last_error}"
                 )
 
-            # ----------------------------------------------------
-            # Progress
-            # ----------------------------------------------------
-
-            if (
-                i % batch_size == 0
-                or i == total
-            ):
-
-                print(
-                    "[VectorStore] Generated "
-                    f"embeddings: {i}/{total}"
+                embeddings.append(
+                    embedding
                 )
 
-        # --------------------------------------------------------
-        # Convert to NumPy
-        # --------------------------------------------------------
+                if (
+                    index == 1
+                    or index % 10 == 0
+                    or index == total
+                ):
+
+                    logger.info(
+                        "Generated embedding "
+                        "%s/%s",
+                        index,
+                        total,
+                    )
+
+            except Exception as exc:
+
+                logger.error(
+                    "Failed to generate embedding "
+                    "%s/%s after %s attempts: %s",
+                    index,
+                    total,
+                    self.max_retries,
+                    exc,
+                )
+
+                raise
 
         matrix = np.asarray(
             embeddings,
-            dtype="float32"
+            dtype=np.float32,
         )
 
-        # --------------------------------------------------------
-        # Safety check
-        # --------------------------------------------------------
-
+        # Safety check.
         if matrix.ndim != 2:
 
             raise RuntimeError(
-                "Embedding matrix has invalid shape: "
-                f"{matrix.shape}"
+                "Embedding matrix must be 2-dimensional."
             )
 
         if matrix.shape[1] != self.dimension:
 
             raise RuntimeError(
-                "Embedding matrix dimension "
-                f"{matrix.shape[1]} does not match "
-                f"expected dimension "
-                f"{self.dimension}."
+                "Embedding matrix dimension mismatch. "
+                f"Expected {self.dimension}, "
+                f"got {matrix.shape[1]}."
             )
-
-        # --------------------------------------------------------
-        # Normalize for cosine similarity
-        # --------------------------------------------------------
-
-        faiss.normalize_L2(
-            matrix
-        )
 
         return matrix
 
@@ -549,42 +699,31 @@ class VectorStore:
     def build_index(
         self,
         chunks: List[Dict[str, Any]],
-        batch_size: int = 8,
-    ):
+    ) -> None:
         """
-        Generate embeddings for code chunks
-        and build the FAISS index.
+        Build a FAISS index from code chunks.
         """
 
         if not chunks:
 
-            print(
-                "[VectorStore] Warning: "
-                "No chunks to index."
+            raise ValueError(
+                "Cannot build vector index from zero chunks."
             )
 
-            return
-
-        print(
-            "[VectorStore] Preparing "
-            f"{len(chunks)} chunks..."
+        logger.info(
+            "Building vector index for %s chunks...",
+            len(chunks),
         )
 
         # --------------------------------------------------------
-        # Keep metadata
-        # --------------------------------------------------------
-
-        self.chunks = list(
-            chunks
-        )
-
-        # --------------------------------------------------------
-        # Build compact representations
+        # Build embedding texts
         # --------------------------------------------------------
 
         texts = []
 
-        for chunk in self.chunks:
+        valid_chunks = []
+
+        for chunk in chunks:
 
             text = (
                 self._build_text_representation(
@@ -594,75 +733,102 @@ class VectorStore:
 
             if not text.strip():
 
+                logger.warning(
+                    "Skipping empty chunk: %s",
+                    chunk.get(
+                        "chunk_id",
+                        "unknown",
+                    ),
+                )
+
                 continue
+
+            # Absolute final safety check.
+            text = text[
+                : self.max_embedding_chars
+            ]
 
             texts.append(
                 text
             )
 
-        if not texts:
-
-            raise RuntimeError(
-                "No valid text was generated "
-                "for embedding."
+            valid_chunks.append(
+                chunk
             )
 
-        print(
-            "[VectorStore] Valid chunks: "
-            f"{len(texts)}/{len(chunks)}"
-        )
+        if not texts:
+
+            raise ValueError(
+                "No valid text available for embedding."
+            )
 
         # --------------------------------------------------------
         # Generate embeddings
         # --------------------------------------------------------
 
         embeddings = self._embed(
-            texts,
-            batch_size=batch_size,
+            texts
         )
 
         # --------------------------------------------------------
-        # Reset FAISS index
+        # Verify metadata/vector alignment
+        # --------------------------------------------------------
+
+        if len(embeddings) != len(
+            valid_chunks
+        ):
+
+            raise RuntimeError(
+                "Vector count does not match "
+                "metadata count. "
+                f"vectors={len(embeddings)}, "
+                f"metadata={len(valid_chunks)}"
+            )
+
+        # --------------------------------------------------------
+        # Normalize embeddings
+        #
+        # IndexFlatIP + normalized vectors gives cosine similarity.
+        # --------------------------------------------------------
+
+        faiss.normalize_L2(
+            embeddings
+        )
+
+        # --------------------------------------------------------
+        # Create FAISS index
         # --------------------------------------------------------
 
         self.index = faiss.IndexFlatIP(
             self.dimension
         )
 
-        # --------------------------------------------------------
-        # Add vectors
-        # --------------------------------------------------------
-
         self.index.add(
             embeddings
         )
 
-        # --------------------------------------------------------
         # IMPORTANT:
-        #
-        # Metadata count must match FAISS vector count.
-        #
-        # If all chunks were valid this is identical to chunks.
-        # --------------------------------------------------------
+        # Store exactly the chunks corresponding to vectors.
+        self.chunks = valid_chunks
 
-        if len(texts) != len(self.chunks):
+        logger.info(
+            "FAISS index built successfully. "
+            "Vectors: %s, Dimensions: %s",
+            self.index.ntotal,
+            self.dimension,
+        )
 
-            print(
-                "[VectorStore] Warning: "
-                f"{len(texts)} texts generated "
-                f"from {len(self.chunks)} chunks."
+        if (
+            self.index.ntotal
+            != len(self.chunks)
+        ):
+
+            raise RuntimeError(
+                "FAISS vector count does not match "
+                "chunk metadata count after index build. "
+                f"vectors={self.index.ntotal}, "
+                f"chunks={len(self.chunks)}"
             )
-
-        print(
-            "[VectorStore] Successfully indexed "
-            f"{self.index.ntotal} chunks into "
-            "FAISS IndexFlatIP."
-        )
-
-        print(
-            "[VectorStore] Embedding dimension: "
-            f"{self.dimension}"
-        )
 
     # ============================================================
     # SEARCH
@@ -671,70 +837,85 @@ class VectorStore:
     def search(
         self,
         query: str,
-        top_k: int = 3,
-    ):
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
         """
-        Search FAISS using an Ollama query embedding.
+        Search the vector index.
         """
+
+        if self.index is None:
+
+            raise RuntimeError(
+                "Vector index has not been built or loaded."
+            )
+
+        if not self.chunks:
+
+            return []
+
+        query = self._safe_string(
+            query
+        ).strip()
 
         if not query:
 
             return []
 
-        if self.index.ntotal == 0:
-
-            return []
-
-        # --------------------------------------------------------
-        # Embed query
-        # --------------------------------------------------------
-
-        query_embedding = self._embed(
-            [query]
+        query_embedding = (
+            self._generate_single_embedding(
+                query
+            )
         )
 
-        # --------------------------------------------------------
-        # Never request more vectors than exist
-        # --------------------------------------------------------
+        query_vector = np.asarray(
+            [query_embedding],
+            dtype=np.float32,
+        )
 
-        k = min(
-            max(1, top_k),
+        faiss.normalize_L2(
+            query_vector
+        )
+
+        actual_k = min(
+            max(
+                int(top_k),
+                1,
+            ),
             self.index.ntotal,
         )
 
-        # --------------------------------------------------------
-        # FAISS search
-        # --------------------------------------------------------
-
         scores, indices = (
             self.index.search(
-                query_embedding,
-                k
+                query_vector,
+                actual_k,
             )
         )
 
         results = []
 
-        for score, idx in zip(
+        for score, index in zip(
             scores[0],
             indices[0],
         ):
 
-            if idx == -1:
-
+            if index < 0:
                 continue
 
-            if idx >= len(
+            if index >= len(
                 self.chunks
             ):
-
                 continue
 
+            chunk = dict(
+                self.chunks[index]
+            )
+
+            chunk["score"] = float(
+                score
+            )
+
             results.append(
-                (
-                    self.chunks[idx],
-                    float(score),
-                )
+                chunk
             )
 
         return results
@@ -745,75 +926,67 @@ class VectorStore:
 
     def save_index(
         self,
-        index_path: str = (
-            "cache/faiss_index.bin"
-        ),
-        metadata_path: str = (
-            "cache/chunks_meta.pkl"
-        ),
-    ):
+        repo_name: str,
+    ) -> Dict[str, str]:
         """
         Save FAISS index and chunk metadata.
         """
 
-        # --------------------------------------------------------
-        # Create directories
-        # --------------------------------------------------------
+        if self.index is None:
 
-        index_directory = (
-            os.path.dirname(
-                index_path
+            raise RuntimeError(
+                "Cannot save an empty vector index."
             )
+
+        repo_dir = os.path.join(
+            self.index_dir,
+            repo_name,
         )
 
-        metadata_directory = (
-            os.path.dirname(
-                metadata_path
-            )
+        os.makedirs(
+            repo_dir,
+            exist_ok=True,
         )
 
-        if index_directory:
+        vector_index_path = os.path.join(
+            repo_dir,
+            "vector_index.faiss",
+        )
 
-            os.makedirs(
-                index_directory,
-                exist_ok=True
-            )
-
-        if metadata_directory:
-
-            os.makedirs(
-                metadata_directory,
-                exist_ok=True
-            )
-
-        # --------------------------------------------------------
-        # Save FAISS
-        # --------------------------------------------------------
+        metadata_path = os.path.join(
+            repo_dir,
+            "metadata.pkl",
+        )
 
         faiss.write_index(
             self.index,
-            index_path
+            vector_index_path,
         )
-
-        # --------------------------------------------------------
-        # Save metadata
-        # --------------------------------------------------------
 
         with open(
             metadata_path,
-            "wb"
-        ) as f:
+            "wb",
+        ) as file:
 
             pickle.dump(
                 self.chunks,
-                f
+                file,
             )
 
-        print(
-            "[VectorStore] Cached FAISS index "
-            f"({self.index.ntotal} vectors) "
-            "and metadata to disk."
+        logger.info(
+            "Vector index saved: %s",
+            vector_index_path,
         )
+
+        logger.info(
+            "Metadata saved: %s",
+            metadata_path,
+        )
+
+        return {
+            "vector_index": vector_index_path,
+            "metadata": metadata_path,
+        }
 
     # ============================================================
     # LOAD INDEX
@@ -821,179 +994,167 @@ class VectorStore:
 
     def load_index(
         self,
-        index_path: str = (
-            "cache/faiss_index.bin"
-        ),
-        metadata_path: str = (
-            "cache/chunks_meta.pkl"
-        ),
+        repo_name: str,
     ) -> bool:
         """
-        Load FAISS index and metadata from disk.
+        Load FAISS index and metadata.
         """
 
-        if not (
-            os.path.exists(index_path)
-            and os.path.exists(metadata_path)
+        repo_dir = os.path.join(
+            self.index_dir,
+            repo_name,
+        )
+
+        vector_index_path = os.path.join(
+            repo_dir,
+            "vector_index.faiss",
+        )
+
+        metadata_path = os.path.join(
+            repo_dir,
+            "metadata.pkl",
+        )
+
+        if not os.path.exists(
+            vector_index_path
         ):
 
-            print(
-                "[VectorStore] No cached index found."
+            logger.warning(
+                "FAISS index not found: %s",
+                vector_index_path,
+            )
+
+            return False
+
+        if not os.path.exists(
+            metadata_path
+        ):
+
+            logger.warning(
+                "Metadata not found: %s",
+                metadata_path,
             )
 
             return False
 
         try:
 
-            # ----------------------------------------------------
-            # Load FAISS
-            # ----------------------------------------------------
-
-            loaded_index = (
-                faiss.read_index(
-                    index_path
-                )
+            loaded_index = faiss.read_index(
+                vector_index_path
             )
-
-            # ----------------------------------------------------
-            # Dimension check
-            # ----------------------------------------------------
-
-            if (
-                loaded_index.d
-                != self.dimension
-            ):
-
-                print(
-                    "[VectorStore] Cached FAISS "
-                    "index dimension is "
-                    f"{loaded_index.d}, "
-                    "but current embedding "
-                    "dimension is "
-                    f"{self.dimension}."
-                )
-
-                print(
-                    "[VectorStore] Ignoring "
-                    "incompatible cached index."
-                )
-
-                return False
-
-            # ----------------------------------------------------
-            # Load metadata
-            # ----------------------------------------------------
 
             with open(
                 metadata_path,
-                "rb"
-            ) as f:
+                "rb",
+            ) as file:
 
-                loaded_chunks = (
-                    pickle.load(f)
+                loaded_chunks = pickle.load(
+                    file
                 )
-
-            # ----------------------------------------------------
-            # Validate metadata
-            # ----------------------------------------------------
 
             if not isinstance(
                 loaded_chunks,
-                list
+                list,
             ):
 
-                print(
-                    "[VectorStore] Invalid "
-                    "metadata format."
+                raise RuntimeError(
+                    "Loaded metadata is not a list."
                 )
-
-                return False
-
-            # ----------------------------------------------------
-            # IMPORTANT:
-            #
-            # FAISS vector count must match
-            # metadata count.
-            # ----------------------------------------------------
 
             if (
                 loaded_index.ntotal
                 != len(loaded_chunks)
             ):
 
-                print(
-                    "[VectorStore] Cached index "
-                    "metadata mismatch:"
+                raise RuntimeError(
+                    "Loaded FAISS index and metadata "
+                    "are out of sync. "
+                    f"vectors={loaded_index.ntotal}, "
+                    f"metadata={len(loaded_chunks)}"
                 )
 
-                print(
-                    f"  FAISS vectors: "
-                    f"{loaded_index.ntotal}"
+            if (
+                loaded_index.d
+                != self.dimension
+            ):
+
+                raise RuntimeError(
+                    "Loaded FAISS dimension mismatch. "
+                    f"Expected {self.dimension}, "
+                    f"got {loaded_index.d}"
                 )
-
-                print(
-                    f"  Metadata chunks: "
-                    f"{len(loaded_chunks)}"
-                )
-
-                print(
-                    "[VectorStore] Ignoring "
-                    "inconsistent cache."
-                )
-
-                return False
-
-            # ----------------------------------------------------
-            # Assign loaded state
-            # ----------------------------------------------------
 
             self.index = loaded_index
+            self.chunks = loaded_chunks
 
-            self.chunks = (
-                loaded_chunks
+            logger.info(
+                "FAISS index loaded successfully. "
+                "Vectors: %s, Dimensions: %s",
+                self.index.ntotal,
+                self.index.d,
             )
 
-            print(
-                "[VectorStore] Successfully "
-                "loaded cached FAISS index "
-                f"({self.index.ntotal} items)."
+            logger.info(
+                "Metadata loaded: %s chunks",
+                len(self.chunks),
             )
 
             return True
 
-        except Exception as e:
+        except Exception as exc:
 
-            print(
-                "[VectorStore] Failed to load "
-                f"cached index: {e}"
+            logger.error(
+                "Failed to load vector index: %s",
+                exc,
             )
 
-            print(
-                "[VectorStore] Rebuilding index..."
-            )
+            self.index = None
+            self.chunks = []
 
             return False
 
     # ============================================================
-    # UTILITY
+    # STATS
     # ============================================================
 
     def get_stats(self) -> Dict[str, Any]:
         """
-        Return useful vector store statistics.
+        Return vector store statistics.
         """
 
         return {
-            "model": self.model_name,
-            "dimension": self.dimension,
-            "vectors": int(
+            "index_loaded": self.index is not None,
+            "vector_count": (
                 self.index.ntotal
+                if self.index is not None
+                else 0
             ),
-            "metadata_chunks": len(
+            "dimension": (
+                self.index.d
+                if self.index is not None
+                else self.dimension
+            ),
+            "metadata_count": len(
                 self.chunks
             ),
+            "model_name": self.model_name,
             "max_embedding_chars": (
                 self.max_embedding_chars
             ),
-            "ollama_url": self.ollama_url,
         }
+
+    # ============================================================
+    # CLEAR
+    # ============================================================
+
+    def clear(self) -> None:
+        """
+        Clear the current in-memory index.
+        """
+
+        self.index = None
+        self.chunks = []
+
+        logger.info(
+            "Vector store cleared."
+        )

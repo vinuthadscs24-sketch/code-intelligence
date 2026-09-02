@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import re
 
 from src.vector_store import VectorStore
@@ -16,7 +16,8 @@ class CodeIntelligenceEngine:
         2. Graph-aware context enrichment
         3. Git/context integration
         4. Deterministic contextual answers
-        5. Caller/callee and impact-aware queries
+        5. Caller/callee queries
+        6. Impact-aware queries
     """
 
     def __init__(
@@ -36,9 +37,9 @@ class CodeIntelligenceEngine:
             knowledge_graph=self.graph_db,
         )
 
-    # ---------------------------------------------------------------
-    # Query
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # MAIN QUERY
+    # ===============================================================
 
     def answer_query(
         self,
@@ -56,7 +57,7 @@ class CodeIntelligenceEngine:
         query = query.strip()
 
         # -----------------------------------------------------------
-        # 1. Detect graph-specific caller query
+        # 1. Caller query
         # -----------------------------------------------------------
 
         caller_target = self._extract_caller_target(query)
@@ -69,7 +70,7 @@ class CodeIntelligenceEngine:
             )
 
         # -----------------------------------------------------------
-        # 2. Detect graph-specific callee query
+        # 2. Callee query
         # -----------------------------------------------------------
 
         callee_target = self._extract_callee_target(query)
@@ -91,7 +92,7 @@ class CodeIntelligenceEngine:
         )
 
         # -----------------------------------------------------------
-        # 4. Build contextual answer
+        # 4. Contextual answer
         # -----------------------------------------------------------
 
         answer = self._build_contextual_answer(
@@ -105,9 +106,9 @@ class CodeIntelligenceEngine:
             "answer": answer,
         }
 
-    # ---------------------------------------------------------------
-    # Caller Query
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # CALLER QUERY
+    # ===============================================================
 
     def _answer_caller_query(
         self,
@@ -116,62 +117,41 @@ class CodeIntelligenceEngine:
         top_k: int,
     ) -> Dict[str, Any]:
 
-        callers = self.graph_db.get_callers_of(
-            method_name
-        )
+        callers = self._resolve_method_callers(method_name)
 
-        # Try alternate method forms if exact lookup fails
-        if not callers:
-            callers = self._find_callers_fuzzy(
-                method_name
-            )
-
-        retrieved_chunks = []
-
-        # -----------------------------------------------------------
-        # Build useful graph results
-        # -----------------------------------------------------------
+        retrieved_chunks: List[Dict[str, Any]] = []
 
         for caller in callers[:top_k]:
 
-            class_name, caller_method = (
-                self._split_method_id(caller)
+            class_name, caller_method = self._split_method_id(caller)
+
+            retrieved_chunks.append(
+                {
+                    "chunk_id": caller,
+                    "chunk_type": "METHOD",
+                    "class_name": class_name,
+                    "method_name": caller_method,
+                    "file_name": self._get_node_file(caller),
+                    "graph_callers": self.graph_db.get_callers_of(caller),
+                    "graph_callees": self.graph_db.get_calls_from(caller),
+                    "sources": ["graph"],
+                    "graph_rank": len(retrieved_chunks) + 1,
+                    "final_rank": len(retrieved_chunks) + 1,
+                }
             )
-
-            retrieved_chunks.append({
-                "chunk_id": caller,
-                "chunk_type": "METHOD",
-                "class_name": class_name,
-                "method_name": caller_method,
-                "file_name": self._get_node_file(caller),
-                "graph_callers": [],
-                "graph_callees": self.graph_db.get_calls_from(
-                    caller
-                ),
-                "sources": ["graph"],
-                "graph_rank": len(retrieved_chunks) + 1,
-                "final_rank": len(retrieved_chunks) + 1,
-            })
-
-        # -----------------------------------------------------------
-        # Construct answer
-        # -----------------------------------------------------------
 
         if not callers:
             answer = (
-                f"No methods calling '{method_name}' "
+                f"No methods calling '{method_name}()' "
                 f"were found in the code graph."
             )
-
         else:
             lines = [
                 f"Methods that call '{method_name}()':"
             ]
 
             for caller in callers[:top_k]:
-                lines.append(
-                    f"- {caller}"
-                )
+                lines.append(f"- {caller}")
 
             answer = "\n".join(lines)
 
@@ -181,9 +161,9 @@ class CodeIntelligenceEngine:
             "answer": answer,
         }
 
-    # ---------------------------------------------------------------
-    # Callee Query
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # CALLEE QUERY
+    # ===============================================================
 
     def _answer_callee_query(
         self,
@@ -192,53 +172,41 @@ class CodeIntelligenceEngine:
         top_k: int,
     ) -> Dict[str, Any]:
 
-        callees = self.graph_db.get_calls_from(
-            method_name
-        )
+        callees = self._resolve_method_callees(method_name)
 
-        if not callees:
-            callees = self._find_callees_fuzzy(
-                method_name
-            )
-
-        retrieved_chunks = []
+        retrieved_chunks: List[Dict[str, Any]] = []
 
         for callee in callees[:top_k]:
 
-            class_name, callee_method = (
-                self._split_method_id(callee)
-            )
+            class_name, callee_method = self._split_method_id(callee)
 
-            retrieved_chunks.append({
-                "chunk_id": callee,
-                "chunk_type": "METHOD",
-                "class_name": class_name,
-                "method_name": callee_method,
-                "file_name": self._get_node_file(callee),
-                "graph_callers": self.graph_db.get_callers_of(
-                    callee
-                ),
-                "graph_callees": [],
-                "sources": ["graph"],
-                "graph_rank": len(retrieved_chunks) + 1,
-                "final_rank": len(retrieved_chunks) + 1,
-            })
+            retrieved_chunks.append(
+                {
+                    "chunk_id": callee,
+                    "chunk_type": "METHOD",
+                    "class_name": class_name,
+                    "method_name": callee_method,
+                    "file_name": self._get_node_file(callee),
+                    "graph_callers": self.graph_db.get_callers_of(callee),
+                    "graph_callees": self.graph_db.get_calls_from(callee),
+                    "sources": ["graph"],
+                    "graph_rank": len(retrieved_chunks) + 1,
+                    "final_rank": len(retrieved_chunks) + 1,
+                }
+            )
 
         if not callees:
             answer = (
                 f"No methods called by '{method_name}()' "
                 f"were found in the code graph."
             )
-
         else:
             lines = [
                 f"Methods called by '{method_name}()':"
             ]
 
             for callee in callees[:top_k]:
-                lines.append(
-                    f"- {callee}"
-                )
+                lines.append(f"- {callee}")
 
             answer = "\n".join(lines)
 
@@ -248,128 +216,406 @@ class CodeIntelligenceEngine:
             "answer": answer,
         }
 
-    # ---------------------------------------------------------------
-    # Query Detection
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # QUERY DETECTION
+    # ===============================================================
 
-    @staticmethod
+    @classmethod
     def _extract_caller_target(
+        cls,
         query: str,
     ) -> Optional[str]:
 
-        patterns = [
-            r"which\s+(?:methods?|functions?|classes?)\s+call\s+([A-Za-z_$][\w$]*)",
-            r"who\s+calls\s+([A-Za-z_$][\w$]*)",
-            r"what\s+calls\s+([A-Za-z_$][\w$]*)",
-            r"callers?\s+of\s+([A-Za-z_$][\w$]*)",
-        ]
+        if not query:
+            return None
 
-        query_lower = query.lower()
+        patterns = [
+            # Who calls bookEquipment?
+            r"\bwho\s+calls\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
+
+            # What calls bookEquipment?
+            r"\bwhat\s+calls\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
+
+            # Callers of bookEquipment
+            r"\bcallers?\s+of\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
+
+            # Which methods call bookEquipment?
+            r"\bwhich\s+(?:methods?|functions?)\s+call\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
+
+            # Which classes call bookEquipment?
+            r"\bwhich\s+classes?\s+call\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
+        ]
 
         for pattern in patterns:
 
             match = re.search(
                 pattern,
-                query_lower,
+                query,
+                flags=re.IGNORECASE,
             )
 
-            if match:
-                return match.group(1)
+            if not match:
+                continue
+
+            candidate = match.group(1)
+
+            candidate = cls._clean_query_method_name(
+                candidate
+            )
+
+            if not cls._is_valid_method_candidate(candidate):
+                continue
+
+            if cls._is_stopword_candidate(candidate):
+                continue
+
+            # -------------------------------------------------------
+            # CRITICAL VALIDATION
+            #
+            # Do not route a natural-language word to the graph.
+            # Example:
+            #
+            # "Which methods call other methods related to booking?"
+            #
+            # "other" must NOT become a method target.
+            # -------------------------------------------------------
+
+            return candidate
 
         return None
+
+    @classmethod
+    def _extract_callee_target(
+        cls,
+        query: str,
+    ) -> Optional[str]:
+
+        if not query:
+            return None
+
+        patterns = [
+            # What does bookEquipment call?
+            r"\bwhat\s+does\s+([A-Za-z_$][\w$]*(?:\(\))?)\s+call\b",
+
+            # Which methods does bookEquipment call?
+            r"\bwhich\s+(?:methods?|functions?)\s+does\s+([A-Za-z_$][\w$]*(?:\(\))?)\s+call\b",
+
+            # Callees of bookEquipment
+            r"\bcallees?\s+of\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
+
+            # What methods are called by bookEquipment?
+            r"\bwhat\s+(?:methods?|functions?)\s+(?:are|does)\s+called\s+by\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
+        ]
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                query,
+                flags=re.IGNORECASE,
+            )
+
+            if not match:
+                continue
+
+            candidate = match.group(1)
+
+            candidate = cls._clean_query_method_name(
+                candidate
+            )
+
+            if not cls._is_valid_method_candidate(candidate):
+                continue
+
+            if cls._is_stopword_candidate(candidate):
+                continue
+
+            return candidate
+
+        return None
+
+    # ===============================================================
+    # QUERY METHOD NORMALIZATION
+    # ===============================================================
 
     @staticmethod
-    def _extract_callee_target(
-        query: str,
-    ) -> Optional[str]:
+    def _clean_query_method_name(
+        method_name: str,
+    ) -> str:
 
-        patterns = [
-            r"which\s+(?:methods?|functions?)\s+does\s+([A-Za-z_$][\w$]*)\s+call",
-            r"what\s+does\s+([A-Za-z_$][\w$]*)\s+call",
-            r"callees?\s+of\s+([A-Za-z_$][\w$]*)",
-        ]
+        if not method_name:
+            return ""
 
-        query_lower = query.lower()
+        value = str(method_name).strip()
 
-        for pattern in patterns:
+        # Remove surrounding punctuation.
+        value = value.strip(
+            " \t\r\n.,;:!?\"'`()[]{}"
+        )
 
-            match = re.search(
-                pattern,
-                query_lower,
+        # Remove trailing parentheses.
+        if value.endswith("()"):
+            value = value[:-2]
+
+        return value.strip()
+
+    @staticmethod
+    def _is_valid_method_candidate(
+        method_name: str,
+    ) -> bool:
+
+        if not method_name:
+            return False
+
+        # Supports:
+        #
+        # booking
+        # bookEquipment
+        # _bookEquipment
+        # $helper
+        #
+        # Also supports class-qualified names:
+        #
+        # BookingService.bookEquipment
+
+        return bool(
+            re.fullmatch(
+                r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*",
+                method_name,
+            )
+        )
+
+    @staticmethod
+    def _is_stopword_candidate(
+        method_name: str,
+    ) -> bool:
+
+        stopwords = {
+            "a",
+            "an",
+            "the",
+            "other",
+            "another",
+            "methods",
+            "method",
+            "function",
+            "functions",
+            "class",
+            "classes",
+            "code",
+            "codes",
+            "anything",
+            "something",
+            "it",
+            "this",
+            "that",
+            "these",
+            "those",
+            "related",
+            "used",
+            "use",
+            "work",
+            "working",
+            "functionality",
+            "some",
+            "any",
+            "all",
+            "things",
+        }
+
+        return method_name.lower() in stopwords
+
+    # ===============================================================
+    # GRAPH RESOLUTION
+    # ===============================================================
+
+    def _resolve_method_callers(
+        self,
+        method_name: str,
+    ) -> List[str]:
+
+        method_name = self._clean_query_method_name(
+            method_name
+        )
+
+        if not method_name:
+            return []
+
+        results: List[str] = []
+
+        # -----------------------------------------------------------
+        # 1. Exact graph lookup
+        # -----------------------------------------------------------
+
+        try:
+            exact = self.graph_db.get_callers_of(
+                method_name
             )
 
-            if match:
-                return match.group(1)
+            if exact:
+                results.extend(exact)
 
-        return None
+        except Exception:
+            pass
 
-    # ---------------------------------------------------------------
-    # Fuzzy Caller Search
-    # ---------------------------------------------------------------
+        # -----------------------------------------------------------
+        # 2. Fuzzy method-node lookup
+        # -----------------------------------------------------------
+
+        if not results:
+            results.extend(
+                self._find_callers_fuzzy(
+                    method_name
+                )
+            )
+
+        return list(dict.fromkeys(results))
+
+    def _resolve_method_callees(
+        self,
+        method_name: str,
+    ) -> List[str]:
+
+        method_name = self._clean_query_method_name(
+            method_name
+        )
+
+        if not method_name:
+            return []
+
+        results: List[str] = []
+
+        try:
+            exact = self.graph_db.get_calls_from(
+                method_name
+            )
+
+            if exact:
+                results.extend(exact)
+
+        except Exception:
+            pass
+
+        if not results:
+            results.extend(
+                self._find_callees_fuzzy(
+                    method_name
+                )
+            )
+
+        return list(dict.fromkeys(results))
+
+    # ===============================================================
+    # FUZZY CALLER SEARCH
+    # ===============================================================
 
     def _find_callers_fuzzy(
         self,
         method_name: str,
     ) -> List[str]:
 
-        results = []
+        results: List[str] = []
 
-        target = method_name.lower()
+        target = self._clean_query_method_name(
+            method_name
+        ).lower()
+
+        if not target:
+            return results
 
         for node in self.graph_db.graph.nodes():
 
+            node_data = self.graph_db.graph.nodes[node]
+
+            # Only real method nodes.
+            if node_data.get("type") != "METHOD":
+                continue
+
             node_str = str(node)
 
-            if (
-                node_str.lower() == target
-                or node_str.lower().endswith(
-                    f".{target}()"
-                )
-            ):
+            clean_node = node_str
 
+            if clean_node.endswith("()"):
+                clean_node = clean_node[:-2]
+
+            node_name = (
+                clean_node.rsplit(".", 1)[-1]
+                .strip()
+                .lower()
+            )
+
+            if node_name != target:
+                continue
+
+            try:
                 callers = self.graph_db.get_callers_of(
                     node_str
                 )
 
                 results.extend(callers)
 
+            except Exception:
+                continue
+
         return list(dict.fromkeys(results))
 
-    # ---------------------------------------------------------------
-    # Fuzzy Callee Search
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # FUZZY CALLEE SEARCH
+    # ===============================================================
 
     def _find_callees_fuzzy(
         self,
         method_name: str,
     ) -> List[str]:
 
-        results = []
+        results: List[str] = []
 
-        target = method_name.lower()
+        target = self._clean_query_method_name(
+            method_name
+        ).lower()
+
+        if not target:
+            return results
 
         for node in self.graph_db.graph.nodes():
 
+            node_data = self.graph_db.graph.nodes[node]
+
+            # Only real method nodes.
+            if node_data.get("type") != "METHOD":
+                continue
+
             node_str = str(node)
 
-            if (
-                node_str.lower() == target
-                or node_str.lower().endswith(
-                    f".{target}()"
-                )
-            ):
+            clean_node = node_str
 
-                results.extend(
-                    self.graph_db.get_calls_from(
-                        node_str
-                    )
+            if clean_node.endswith("()"):
+                clean_node = clean_node[:-2]
+
+            node_name = (
+                clean_node.rsplit(".", 1)[-1]
+                .strip()
+                .lower()
+            )
+
+            if node_name != target:
+                continue
+
+            try:
+                callees = self.graph_db.get_calls_from(
+                    node_str
                 )
+
+                results.extend(callees)
+
+            except Exception:
+                continue
 
         return list(dict.fromkeys(results))
 
-    # ---------------------------------------------------------------
-    # Graph Helpers
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # GRAPH HELPERS
+    # ===============================================================
 
     def _get_node_file(
         self,
@@ -378,35 +624,39 @@ class CodeIntelligenceEngine:
 
         if self.graph_db.graph.has_node(node_id):
 
-            return self.graph_db.graph.nodes[
-                node_id
-            ].get("file", "")
+            node_data = self.graph_db.graph.nodes[node_id]
+
+            return (
+                node_data.get("file", "")
+                or node_data.get("file_name", "")
+                or node_data.get("file_path", "")
+            )
 
         return ""
 
     @staticmethod
     def _split_method_id(
         method_id: str,
-    ) -> tuple:
+    ) -> Tuple[str, str]:
 
-        clean = method_id.replace(
-            "()",
-            "",
-        )
+        clean = str(method_id).strip()
+
+        if clean.endswith("()"):
+            clean = clean[:-2]
 
         if "." in clean:
-
-            class_name, method_name = (
-                clean.rsplit(".", 1)
+            class_name, method_name = clean.rsplit(
+                ".",
+                1,
             )
 
             return class_name, method_name
 
         return "", clean
 
-    # ---------------------------------------------------------------
-    # Normal Contextual Answer
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # NORMAL CONTEXTUAL ANSWER
+    # ===============================================================
 
     def _build_contextual_answer(
         self,
@@ -419,7 +669,7 @@ class CodeIntelligenceEngine:
                 "No relevant code was found in the indexed repository."
             )
 
-        lines = []
+        lines: List[str] = []
 
         lines.append(
             f'Based on the indexed codebase, the most relevant code '
@@ -506,10 +756,11 @@ class CodeIntelligenceEngine:
 
             if code:
 
-                code_preview = code.strip()
+                code_preview = str(
+                    code
+                ).strip()
 
                 if len(code_preview) > 500:
-
                     code_preview = (
                         code_preview[:500]
                         + "..."
@@ -524,9 +775,9 @@ class CodeIntelligenceEngine:
 
         return "\n".join(lines)
 
-    # ---------------------------------------------------------------
-    # Utility
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # UTILITY
+    # ===============================================================
 
     @staticmethod
     def _indent_code(
@@ -538,9 +789,9 @@ class CodeIntelligenceEngine:
             for line in code.splitlines()
         )
 
-    # ---------------------------------------------------------------
-    # Impact Analysis
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # IMPACT ANALYSIS
+    # ===============================================================
 
     def get_impact(
         self,
@@ -548,7 +799,6 @@ class CodeIntelligenceEngine:
     ) -> Dict[str, Any]:
 
         if not method_name:
-
             return {
                 "error": "Method name cannot be empty."
             }
@@ -563,9 +813,9 @@ class CodeIntelligenceEngine:
             method_name
         )
 
-    # ---------------------------------------------------------------
-    # Git History
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # GIT HISTORY
+    # ===============================================================
 
     def get_file_history(
         self,
@@ -573,7 +823,6 @@ class CodeIntelligenceEngine:
     ) -> Any:
 
         if self.context_builder is None:
-
             return {
                 "error": (
                     "Git context builder is not initialized."
@@ -587,7 +836,6 @@ class CodeIntelligenceEngine:
         )
 
         if git_intel is None:
-
             return {
                 "error": (
                     "Git intelligence is not available."
@@ -598,9 +846,9 @@ class CodeIntelligenceEngine:
             file_path
         )
 
-    # ---------------------------------------------------------------
-    # Why Changed / Provenance
-    # ---------------------------------------------------------------
+    # ===============================================================
+    # WHY CHANGED / PROVENANCE
+    # ===============================================================
 
     def explain_why_changed(
         self,
@@ -611,7 +859,6 @@ class CodeIntelligenceEngine:
     ) -> Dict[str, Any]:
 
         if self.context_builder is None:
-
             return {
                 "answer": (
                     "Git context builder is not initialized."

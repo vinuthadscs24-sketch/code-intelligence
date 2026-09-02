@@ -142,6 +142,7 @@ def _normalise_graph_result(value):
 
     Handles lists, tuples, sets, dictionaries and None.
     """
+
     if value is None:
         return []
 
@@ -154,28 +155,48 @@ def _normalise_graph_result(value):
     return [value]
 
 
-def _call_graph_method(graph, method_name: str, entity_name: str):
+def _call_graph_method(
+    graph,
+    method_name: str,
+    entity_name: str,
+):
     """
     Safely call a graph method.
 
     Some versions of graph_builder.py may return different
     structures, so this wrapper keeps the API stable.
     """
-    method = getattr(graph, method_name, None)
+
+    method = getattr(
+        graph,
+        method_name,
+        None,
+    )
 
     if method is None:
         return []
 
     try:
-        result = method(entity_name)
-        return _normalise_graph_result(result)
+
+        result = method(
+            entity_name
+        )
+
+        return _normalise_graph_result(
+            result
+        )
+
     except TypeError:
+
         return []
+
     except Exception as exc:
+
         print(
             f"[Graph] {method_name} failed for "
             f"{entity_name}: {exc}"
         )
+
         return []
 
 
@@ -185,6 +206,7 @@ def _call_graph_method(graph, method_name: str, entity_name: str):
 
 @app.get("/health")
 def health_check():
+
     return {
         "status": "online",
         "indexed": state.is_indexed,
@@ -202,9 +224,12 @@ def health_check():
 
 @app.post("/api/repository/index")
 @app.post("/index")
-def index_repository(payload: IndexRequest):
+def index_repository(
+    payload: IndexRequest,
+):
 
     try:
+
         target_url = payload.url
 
         print(
@@ -221,6 +246,7 @@ def index_repository(payload: IndexRequest):
             and state.repo_path
             and state.repo_path.exists()
         ):
+
             print(
                 "[Index] Removing previous temporary repository..."
             )
@@ -236,6 +262,8 @@ def index_repository(payload: IndexRequest):
 
         state.is_indexed = False
         state.repo_path = None
+        state.is_temp = False
+        state.parser = None
         state.graph_db = None
         state.vector_store = None
         state.git_intel = None
@@ -250,9 +278,12 @@ def index_repository(payload: IndexRequest):
             target_url
         )
 
-        repo_path = Path(repo_path)
+        repo_path = Path(
+            repo_path
+        )
 
         if not repo_path.exists():
+
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -262,6 +293,7 @@ def index_repository(payload: IndexRequest):
             )
 
         if not repo_path.is_dir():
+
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -272,6 +304,18 @@ def index_repository(payload: IndexRequest):
 
         print(
             f"[Index] Repository path: {repo_path}"
+        )
+
+        # -------------------------------------------------
+        # Repository name
+        #
+        # This is used for the FAISS index directory.
+        # -------------------------------------------------
+
+        repo_name = repo_path.name
+
+        print(
+            f"[Index] Repository name: {repo_name}"
         )
 
         # -------------------------------------------------
@@ -324,10 +368,14 @@ def index_repository(payload: IndexRequest):
                 for part in source_file.parts
             }
 
-            if parts_lower.intersection(ignored_dirs):
+            if parts_lower.intersection(
+                ignored_dirs
+            ):
                 continue
 
-            extension = source_file.suffix.lower()
+            extension = (
+                source_file.suffix.lower()
+            )
 
             if extension not in supported_extensions:
                 continue
@@ -347,6 +395,7 @@ def index_repository(payload: IndexRequest):
             )
 
             if parser is None:
+
                 skipped_files += 1
                 continue
 
@@ -357,6 +406,7 @@ def index_repository(payload: IndexRequest):
                 )
 
                 if not result:
+
                     skipped_files += 1
                     continue
 
@@ -369,6 +419,7 @@ def index_repository(payload: IndexRequest):
                 )
 
                 if not source_code.strip():
+
                     skipped_files += 1
                     continue
 
@@ -402,14 +453,17 @@ def index_repository(payload: IndexRequest):
                 skipped_files += 1
 
         print(
-            f"[Index] Parsed files: {parsed_files}"
+            f"[Index] Parsed files: "
+            f"{parsed_files}"
         )
 
         print(
-            f"[Index] Skipped files: {skipped_files}"
+            f"[Index] Skipped files: "
+            f"{skipped_files}"
         )
 
         if not extracted_data:
+
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -437,9 +491,12 @@ def index_repository(payload: IndexRequest):
         )
 
         if not chunks:
+
             raise HTTPException(
                 status_code=400,
-                detail="No code chunks were generated.",
+                detail=(
+                    "No code chunks were generated."
+                ),
             )
 
         # -------------------------------------------------
@@ -468,17 +525,38 @@ def index_repository(payload: IndexRequest):
 
         index_loaded = False
 
+        # -------------------------------------------------
+        # Load existing index
+        #
+        # IMPORTANT:
+        # VectorStore.load_index() requires repo_name.
+        # -------------------------------------------------
+
         if not payload.rebuild_index:
+
             try:
-                index_loaded = store.load_index()
+
+                index_loaded = store.load_index(
+                    repo_name
+                )
+
             except Exception as exc:
+
                 print(
-                    f"[Index] Existing index could not "
+                    "[Index] Existing index could not "
                     f"be loaded: {exc}"
                 )
+
                 index_loaded = False
 
-        if payload.rebuild_index or not index_loaded:
+        # -------------------------------------------------
+        # Build new FAISS index
+        # -------------------------------------------------
+
+        if (
+            payload.rebuild_index
+            or not index_loaded
+        ):
 
             print(
                 "[Index] Building FAISS vector index..."
@@ -488,13 +566,32 @@ def index_repository(payload: IndexRequest):
                 chunks
             )
 
-            store.save_index()
+            # IMPORTANT:
+            # save_index() requires repo_name.
+            store.save_index(
+                repo_name
+            )
+
+            print(
+                "[Index] FAISS vector index saved."
+            )
 
         else:
 
             print(
                 "[Index] Existing FAISS index loaded."
             )
+
+        # -------------------------------------------------
+        # Verify vector store
+        # -------------------------------------------------
+
+        vector_stats = store.get_stats()
+
+        print(
+            "[Index] Vector store stats: "
+            f"{vector_stats}"
+        )
 
         # -------------------------------------------------
         # Git intelligence
@@ -505,7 +602,9 @@ def index_repository(payload: IndexRequest):
         )
 
         git_intel = GitIntelligence(
-            repo_path=str(repo_path)
+            repo_path=str(
+                repo_path
+            )
         )
 
         context_builder = (
@@ -523,7 +622,9 @@ def index_repository(payload: IndexRequest):
         )
 
         engine = CodeIntelligenceEngine(
-            repo_path=str(repo_path),
+            repo_path=str(
+                repo_path
+            ),
             vector_store=store,
             graph_db=kg,
             context_builder=context_builder,
@@ -549,10 +650,14 @@ def index_repository(payload: IndexRequest):
         # -------------------------------------------------
 
         try:
+
             summary = kg.get_summary()
+
         except Exception as exc:
+
             print(
-                f"[Index] Graph summary failed: {exc}"
+                f"[Index] Graph summary failed: "
+                f"{exc}"
             )
 
             summary = {
@@ -560,16 +665,28 @@ def index_repository(payload: IndexRequest):
                 "total_edges": 0,
             }
 
+        # -------------------------------------------------
+        # Success response
+        # -------------------------------------------------
+
         return {
             "status": "success",
-            "message": "Repository indexed successfully.",
-            "repoName": repo_path.name,
-            "total_files": len(extracted_data),
-            "total_chunks": len(chunks),
+            "message": (
+                "Repository indexed successfully."
+            ),
+            "repoName": repo_name,
+            "total_files": len(
+                extracted_data
+            ),
+            "total_chunks": len(
+                chunks
+            ),
+            "vector_stats": vector_stats,
             "graph_summary": summary,
         }
 
     except HTTPException:
+
         raise
 
     except ValueError as exc:
@@ -592,7 +709,9 @@ def index_repository(payload: IndexRequest):
 
         raise HTTPException(
             status_code=500,
-            detail=f"Indexing failed: {str(exc)}",
+            detail=(
+                f"Indexing failed: {str(exc)}"
+            ),
         )
 
 
@@ -610,6 +729,7 @@ def query_codebase(
         not state.is_indexed
         or not state.engine
     ):
+
         raise HTTPException(
             status_code=400,
             detail=(
@@ -622,12 +742,17 @@ def query_codebase(
 
         q_text = payload.text
 
-        response = state.engine.answer_query(
-            q_text,
-            top_k=payload.top_k,
+        response = (
+            state.engine.answer_query(
+                q_text,
+                top_k=payload.top_k,
+            )
         )
 
-        if isinstance(response, dict):
+        if isinstance(
+            response,
+            dict,
+        ):
 
             answer = response.get(
                 "answer",
@@ -646,7 +771,9 @@ def query_codebase(
 
         else:
 
-            answer = str(response)
+            answer = str(
+                response
+            )
 
             retrieved_chunks = []
 
@@ -675,7 +802,9 @@ def query_codebase(
 
         raise HTTPException(
             status_code=500,
-            detail=f"Query failed: {str(exc)}",
+            detail=(
+                f"Query failed: {str(exc)}"
+            ),
         )
 
 
@@ -683,7 +812,9 @@ def query_codebase(
 # DEPENDENCIES
 # =========================================================
 
-@app.get("/dependencies/{entity_name}")
+@app.get(
+    "/dependencies/{entity_name}"
+)
 def get_entity_dependencies(
     entity_name: str,
 ):
@@ -692,6 +823,7 @@ def get_entity_dependencies(
         not state.is_indexed
         or not state.graph_db
     ):
+
         raise HTTPException(
             status_code=400,
             detail="No repository indexed.",
@@ -747,7 +879,9 @@ def get_entity_dependencies(
 # IMPACT ANALYSIS
 # =========================================================
 
-@app.get("/impact/{entity_name}")
+@app.get(
+    "/impact/{entity_name}"
+)
 def get_impact_analysis(
     entity_name: str,
     max_depth: int = Query(
@@ -761,6 +895,7 @@ def get_impact_analysis(
         not state.is_indexed
         or not state.graph_db
     ):
+
         raise HTTPException(
             status_code=400,
             detail="No repository indexed.",
@@ -802,8 +937,10 @@ def get_impact_analysis(
 
             for caller in callers:
 
-                # Graph results may sometimes be dictionaries.
-                if isinstance(caller, dict):
+                if isinstance(
+                    caller,
+                    dict,
+                ):
 
                     caller_name = (
                         caller.get("name")
@@ -813,7 +950,9 @@ def get_impact_analysis(
 
                 else:
 
-                    caller_name = str(caller)
+                    caller_name = str(
+                        caller
+                    )
 
                 if not caller_name:
                     continue
@@ -821,12 +960,16 @@ def get_impact_analysis(
                 if caller_name in visited:
                     continue
 
-                visited.add(caller_name)
+                visited.add(
+                    caller_name
+                )
 
                 affected_entities.append(
                     {
                         "entity": caller_name,
-                        "distance": distance + 1,
+                        "distance": (
+                            distance + 1
+                        ),
                     }
                 )
 
@@ -866,7 +1009,9 @@ def get_impact_analysis(
 # GIT PROVENANCE
 # =========================================================
 
-@app.post("/history/why-changed")
+@app.post(
+    "/history/why-changed"
+)
 def explain_method_provenance(
     payload: ProvenanceRequest,
 ):
@@ -875,6 +1020,7 @@ def explain_method_provenance(
         not state.is_indexed
         or not state.engine
     ):
+
         raise HTTPException(
             status_code=400,
             detail="No repository indexed.",
