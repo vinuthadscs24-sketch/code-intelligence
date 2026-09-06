@@ -1,5 +1,4 @@
-import pickle
-from src.graph_builder import CodeKnowledgeGraph
+
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import pickle
@@ -20,10 +19,11 @@ from src.data_processing.chunkers import (
     DocumentChunk,
 )
 
+from src.vector_store import VectorStore
 from src.indexing.vector_index import FaissVectorIndex
 from src.indexing.sparse_index import BM25Index
 from src.hybrid_retriever import HybridRetriever
-
+from src.graph_builder import CodeKnowledgeGraph
 
 
 class RAGPipeline:
@@ -35,16 +35,17 @@ class RAGPipeline:
         Repository
             ↓
         Documents
-            ↓
-        AST-aware chunks
-            ├── FAISS
-            ├── BM25
-            └── Knowledge Graph
-                    ├── Classes
-                    ├── Methods
-                    ├── HAS_METHOD
-                    ├── INJECTS
-                    └── CALLS
+            ├── AST-aware chunks → FAISS
+            ├── AST-aware chunks → BM25
+            └── Original documents → Knowledge Graph
+                                      ├── FILE
+                                      ├── CLASS
+                                      ├── FUNCTION
+                                      ├── METHOD
+                                      ├── CONTAINS
+                                      ├── CALLS
+                                      ├── IMPORTS
+                                      └── EXTENDS
     """
 
     KNOWLEDGE_GRAPH_FILENAME = "knowledge_graph.pkl"
@@ -104,26 +105,32 @@ class RAGPipeline:
             f"{self.cloned_repo_path}"
         )
 
-        # --------------------------------------------------------
-        # Core components
-        # --------------------------------------------------------
+        # ========================================================
+        # CORE COMPONENTS
+        # ========================================================
 
         self.chunker = CodeRAGChunker()
 
         self.indexes = indexes
 
-        self.retriever = HybridRetriever(
-            index_dir=self.index_dir,
-            indexes=self.indexes,
+        # ========================================================
+        # VECTOR STORE
+        # ========================================================
+
+        self.vector_store = VectorStore(
+            ollama_url=config.OLLAMA_BASE_URL,
+            model_name=config.EMBEDDING_MODEL_NAME,
+            dimension=config.EMBEDDING_DIMENSIONS,
+            index_dir=str(self.index_dir),
         )
 
-        # --------------------------------------------------------
-        # Knowledge graph
-        # --------------------------------------------------------
+        # ========================================================
+        # KNOWLEDGE GRAPH
+        # ========================================================
 
         self.graph_file = (
-            self.index_dir /
-            self.KNOWLEDGE_GRAPH_FILENAME
+            self.index_dir
+            / self.KNOWLEDGE_GRAPH_FILENAME
         )
 
         self.knowledge_graph: Optional[
@@ -131,6 +138,15 @@ class RAGPipeline:
         ] = None
 
         self._load_knowledge_graph()
+
+        # ========================================================
+        # HYBRID RETRIEVER
+        # ========================================================
+
+        self.retriever = HybridRetriever(
+            vector_store=self.vector_store,
+            knowledge_graph=self.knowledge_graph,
+        )
 
     # ============================================================
     # REPOSITORY SETUP
@@ -236,18 +252,18 @@ class RAGPipeline:
         # --------------------------------------------------------
 
         vector_index_file = (
-            self.index_dir /
-            config.FAISS_INDEX_FILENAME
+            self.index_dir
+            / config.FAISS_INDEX_FILENAME
         )
 
         bm25_index_file = (
-            self.index_dir /
-            config.BM25_INDEX_FILENAME
+            self.index_dir
+            / config.BM25_INDEX_FILENAME
         )
 
         metadata_file = (
-            self.index_dir /
-            config.FAISS_METADATA_FILENAME
+            self.index_dir
+            / config.FAISS_METADATA_FILENAME
         )
 
         indexes_exist = (
@@ -274,16 +290,6 @@ class RAGPipeline:
                 f"Indexes and knowledge graph already "
                 f"exist for '{self.repo_id}'."
             )
-
-            if (
-                not self.retriever.vector_index
-                or not self.retriever.bm25_index
-            ):
-                logger.info(
-                    "Reloading retriever indexes..."
-                )
-
-                self.retriever._load_indexes()
 
             return True
 
@@ -444,16 +450,6 @@ class RAGPipeline:
         )
 
         # --------------------------------------------------------
-        # Reload retriever
-        # --------------------------------------------------------
-
-        logger.info(
-            "Reloading indexes in retriever..."
-        )
-
-        self.retriever._load_indexes()
-
-        # --------------------------------------------------------
         # KNOWLEDGE GRAPH
         # --------------------------------------------------------
 
@@ -466,12 +462,12 @@ class RAGPipeline:
         )
 
         logger.info(
-            f"Graph source chunks: "
-            f"{len(document_chunks)}"
+            f"Graph source documents: "
+            f"{len(loaded_documents)}"
         )
 
-        if not self._build_knowledge_graph_from_chunks(
-            document_chunks
+        if not self._build_knowledge_graph_from_documents(
+            loaded_documents
         ):
             logger.error(
                 "Knowledge graph construction failed."
@@ -480,6 +476,14 @@ class RAGPipeline:
 
         logger.info(
             "Knowledge Graph built successfully."
+        )
+
+        # --------------------------------------------------------
+        # Update retriever with newly built graph
+        # --------------------------------------------------------
+
+        self.retriever.kg = (
+            self.knowledge_graph
         )
 
         # --------------------------------------------------------
@@ -519,187 +523,39 @@ class RAGPipeline:
         return True
 
     # ============================================================
-    # BUILD KNOWLEDGE GRAPH
+    # BUILD KNOWLEDGE GRAPH FROM DOCUMENTS
     # ============================================================
 
-    def _build_knowledge_graph_for_repository(
+    def _build_knowledge_graph_from_documents(
         self,
-    ) -> bool:
-
-        if not self.repository_path:
-            logger.error(
-                "Repository path not set. "
-                "Cannot build knowledge graph."
-            )
-            return False
-
-        logger.info(
-            "Loading repository documents for "
-            "knowledge graph..."
-        )
-
-        docs_iterator = load_documents_from_repo(
-            repo_path=self.repository_path,
-            excluded_dirs=config.DEFAULT_EXCLUDED_DIRS,
-            excluded_files=config.DEFAULT_EXCLUDED_FILES,
-            max_file_size_mb=config.MAX_FILE_SIZE_MB,
-        )
-
-        loaded_documents = list(
-            docs_iterator
-        )
-
-        if not loaded_documents:
-            logger.error(
-                "No documents available for "
-                "knowledge graph."
-            )
-            return False
-
-        logger.info(
-            f"Loaded {len(loaded_documents)} documents "
-            "for graph construction."
-        )
-
-        document_chunks = (
-            self.chunker.chunk_documents(
-                loaded_documents
-            )
-        )
-
-        if not document_chunks:
-            logger.error(
-                "No chunks available for "
-                "knowledge graph."
-            )
-            return False
-
-        logger.info(
-            f"Produced {len(document_chunks)} chunks "
-            "for graph construction."
-        )
-
-        return self._build_knowledge_graph_from_chunks(
-            document_chunks
-        )
-
-    # ============================================================
-    # BUILD GRAPH FROM CHUNKS
-    # ============================================================
-
-    def _build_knowledge_graph_from_chunks(
-        self,
-        document_chunks: List[DocumentChunk],
+        loaded_documents: List[LoadedDocument],
     ) -> bool:
 
         try:
 
             logger.info(
-                "Normalizing chunks for knowledge graph..."
+                "Building knowledge graph directly "
+                "from original documents..."
             )
 
-            normalized_chunks = []
+            if not loaded_documents:
 
-            for chunk in document_chunks:
-
-                # ------------------------------------------------
-                # DocumentChunk may be a Pydantic/dataclass object
-                # ------------------------------------------------
-
-                if isinstance(chunk, dict):
-
-                    chunk_dict = dict(chunk)
-
-                elif hasattr(chunk, "model_dump"):
-
-                    chunk_dict = chunk.model_dump()
-
-                elif hasattr(chunk, "dict"):
-
-                    chunk_dict = chunk.dict()
-
-                elif hasattr(chunk, "__dict__"):
-
-                    chunk_dict = vars(chunk).copy()
-
-                else:
-
-                    logger.warning(
-                        "Skipping unsupported chunk type: "
-                        f"{type(chunk)}"
-                    )
-
-                    continue
-
-                # ------------------------------------------------
-                # Normalize common field names
-                # ------------------------------------------------
-
-                if (
-                    "file_name" not in chunk_dict
-                    and "file" not in chunk_dict
-                ):
-                    if "file_path" in chunk_dict:
-                        chunk_dict["file_name"] = str(
-                            chunk_dict["file_path"]
-                        )
-
-                if (
-                    "code_content" not in chunk_dict
-                    and "content" in chunk_dict
-                ):
-                    chunk_dict["code_content"] = (
-                        chunk_dict["content"]
-                    )
-
-                # ------------------------------------------------
-                # Ensure graph builder sees calls
-                # ------------------------------------------------
-
-                if "calls" not in chunk_dict:
-
-                    if "method_calls" in chunk_dict:
-                        chunk_dict["calls"] = (
-                            chunk_dict["method_calls"]
-                        )
-
-                    elif "relationships" in chunk_dict:
-                        chunk_dict["calls"] = (
-                            chunk_dict["relationships"]
-                        )
-
-                    else:
-                        chunk_dict["calls"] = []
-
-                normalized_chunks.append(
-                    chunk_dict
-                )
-
-            logger.info(
-                f"Normalized "
-                f"{len(normalized_chunks)} chunks."
-            )
-
-            if not normalized_chunks:
                 logger.error(
-                    "No compatible chunks available "
-                    "for knowledge graph."
+                    "No documents available for "
+                    "knowledge graph construction."
                 )
-                return False
 
-            # ----------------------------------------------------
-            # Build graph
-            # ----------------------------------------------------
+                return False
 
             graph = CodeKnowledgeGraph()
 
             logger.info(
                 "Calling CodeKnowledgeGraph."
-                "build_graph_from_chunks()..."
+                "build_graph_from_documents()..."
             )
 
-            graph.build_graph_from_chunks(
-                normalized_chunks
+            graph.build_graph_from_documents(
+                loaded_documents
             )
 
             self.knowledge_graph = graph
@@ -709,10 +565,16 @@ class RAGPipeline:
             # ----------------------------------------------------
 
             if not self._save_knowledge_graph():
+
                 logger.error(
                     "Knowledge graph could not be saved."
                 )
+
                 return False
+
+            # ----------------------------------------------------
+            # Summary
+            # ----------------------------------------------------
 
             summary = (
                 graph.get_summary()
@@ -765,6 +627,67 @@ class RAGPipeline:
             return False
 
     # ============================================================
+    # BUILD KNOWLEDGE GRAPH FOR EXISTING INDEXES
+    # ============================================================
+
+    def _build_knowledge_graph_for_repository(
+        self,
+    ) -> bool:
+
+        if not self.repository_path:
+
+            logger.error(
+                "Repository path not set. "
+                "Cannot build knowledge graph."
+            )
+
+            return False
+
+        logger.info(
+            "Loading repository documents for "
+            "knowledge graph..."
+        )
+
+        docs_iterator = load_documents_from_repo(
+            repo_path=self.repository_path,
+            excluded_dirs=config.DEFAULT_EXCLUDED_DIRS,
+            excluded_files=config.DEFAULT_EXCLUDED_FILES,
+            max_file_size_mb=config.MAX_FILE_SIZE_MB,
+        )
+
+        loaded_documents = list(
+            docs_iterator
+        )
+
+        if not loaded_documents:
+
+            logger.error(
+                "No documents available for "
+                "knowledge graph."
+            )
+
+            return False
+
+        logger.info(
+            f"Loaded {len(loaded_documents)} documents "
+            "for graph construction."
+        )
+
+        result = (
+            self._build_knowledge_graph_from_documents(
+                loaded_documents
+            )
+        )
+
+        if result:
+
+            self.retriever.kg = (
+                self.knowledge_graph
+            )
+
+        return result
+
+    # ============================================================
     # SAVE GRAPH
     # ============================================================
 
@@ -773,9 +696,11 @@ class RAGPipeline:
     ) -> bool:
 
         if not self.knowledge_graph:
+
             logger.error(
                 "No knowledge graph available to save."
             )
+
             return False
 
         try:
@@ -821,9 +746,11 @@ class RAGPipeline:
     ) -> bool:
 
         if not self.graph_file.exists():
+
             logger.info(
                 "No persisted knowledge graph found."
             )
+
             return False
 
         try:
@@ -880,6 +807,7 @@ class RAGPipeline:
     ) -> bool:
 
         if not self.graph_file.exists():
+
             return False
 
         try:
@@ -894,14 +822,17 @@ class RAGPipeline:
                 )
 
             if graph is None:
+
                 return False
 
             if graph.number_of_nodes() == 0:
+
                 return False
 
             return True
 
         except Exception:
+
             return False
 
     # ============================================================
@@ -913,13 +844,17 @@ class RAGPipeline:
     ) -> Optional[CodeKnowledgeGraph]:
 
         if self.knowledge_graph:
+
             return self.knowledge_graph
 
         if self._load_knowledge_graph():
+
             return self.knowledge_graph
 
         if self.repository_path:
+
             if self._build_knowledge_graph_for_repository():
+
                 return self.knowledge_graph
 
         return None
@@ -937,11 +872,10 @@ class RAGPipeline:
         bm25_top_k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
 
-        if not self.retriever._load_indexes():
+        if not query_text or not query_text.strip():
 
-            logger.error(
-                f"Failed to load indexes for "
-                f"repo_id '{self.repo_id}'."
+            logger.warning(
+                "Empty query received."
             )
 
             return []
@@ -951,13 +885,24 @@ class RAGPipeline:
             f"{query_text}"
         )
 
-        return self.retriever.retrieve(
-            query_text,
-            top_n_final=top_n_final,
-            vector_top_k=vector_top_k,
-            bm25_top_k=bm25_top_k,
-            apikey=apikey,
-        )
+        try:
+
+            return self.retriever.retrieve(
+                query_text,
+                top_n_final=top_n_final,
+                vector_top_k=vector_top_k,
+                bm25_top_k=bm25_top_k,
+                apikey=apikey,
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Hybrid retrieval failed: "
+                f"{exc}"
+            )
+
+            return []
 
     # ============================================================
     # GET KNOWLEDGE GRAPH
@@ -981,6 +926,7 @@ class RAGPipeline:
         graph = self.ensure_knowledge_graph()
 
         if not graph:
+
             return []
 
         return graph.get_callers_of(
@@ -999,6 +945,7 @@ class RAGPipeline:
         graph = self.ensure_knowledge_graph()
 
         if not graph:
+
             return []
 
         return graph.get_calls_from(
@@ -1016,6 +963,7 @@ class RAGPipeline:
         graph = self.ensure_knowledge_graph()
 
         if not graph:
+
             return None
 
         from src.impact_analysis import (
@@ -1039,37 +987,47 @@ class RAGPipeline:
         graph_summary = None
 
         if graph:
+
             graph_summary = (
                 graph.get_summary()
             )
 
         return {
             "repo_id": self.repo_id,
+
             "repository_path": (
                 str(self.repository_path)
                 if self.repository_path
                 else str(self.cloned_repo_path)
             ),
+
             "index_directory": str(
                 self.index_dir
             ),
+
             "vector_index_exists": (
                 (
-                    self.index_dir /
-                    config.FAISS_INDEX_FILENAME
+                    self.index_dir
+                    / config.FAISS_INDEX_FILENAME
                 ).exists()
             ),
+
             "bm25_index_exists": (
                 (
-                    self.index_dir /
-                    config.BM25_INDEX_FILENAME
+                    self.index_dir
+                    / config.BM25_INDEX_FILENAME
                 ).exists()
             ),
+
             "knowledge_graph_exists": (
                 self.graph_file.exists()
             ),
+
             "knowledge_graph_valid": (
                 self._knowledge_graph_is_valid()
             ),
+
             "graph": graph_summary,
         }
+    
+

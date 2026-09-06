@@ -1,918 +1,1650 @@
-import json
-import re
-import networkx as nx
+
+from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
+import re
+
+import networkx as nx
+from loguru import logger
+
+from src.data_processing.chunkers import get_tree_sitter_parser
 
 
 class CodeKnowledgeGraph:
+    """
+    Generic AST-based Code Knowledge Graph.
+
+    Supported:
+        Python
+        Java
+        JavaScript
+        TypeScript
+
+    Main node types:
+        FILE
+        CLASS
+        INTERFACE
+        FUNCTION
+        METHOD
+        CONSTRUCTOR
+
+    Main relationships:
+        CONTAINS
+        CALLS
+        IMPORTS
+        EXTENDS
+        IMPLEMENTS
+
+    The graph is repository-independent.
+    """
 
     def __init__(self):
         self.graph = nx.DiGraph()
 
+        # --------------------------------------------------------
+        # Symbol indexes
+        # --------------------------------------------------------
+
+        self.symbols_by_name: Dict[str, List[str]] = {}
+        self.functions_by_name: Dict[str, List[str]] = {}
+        self.classes_by_name: Dict[str, List[str]] = {}
+
+        self.methods_by_class: Dict[
+            Tuple[str, str],
+            List[str]
+        ] = {}
+
+        self.symbols_by_file_name: Dict[
+            Tuple[str, str],
+            List[str]
+        ] = {}
+
+        # Used to resolve calls more reliably.
+        self.symbols_by_qualified_name: Dict[
+            str,
+            List[str]
+        ] = {}
+
     # ============================================================
-    # AST-BASED GRAPH
+    # PUBLIC API
     # ============================================================
 
-    def build_graph(
+    def build_graph_from_documents(
         self,
-        repo_name: str,
-        extracted_data: List[
-            Tuple[Union[Path, str], dict]
-        ],
-    ):
+        documents
+    ) -> nx.DiGraph:
         """
-        Construct a directed code knowledge graph.
+        Build the knowledge graph directly from source documents.
 
-        Supports:
-        - Classes
-        - Interfaces
-        - Inheritance
-        - Implementations
-        - Dependency injection
-        - Methods
-        - Method calls
+        This is the preferred graph-building path.
+
+        Each document should expose:
+
+            file_path
+            content
+            language
         """
+
+        self._reset()
+
+        documents = list(documents or [])
+
+        logger.info(
+            f"[Graph] Building AST graph from "
+            f"{len(documents)} documents"
+        )
+
+        parsed_documents = []
+
+        # ========================================================
+        # PASS 1
+        # Parse files and register ALL definitions.
+        # ========================================================
+
+        for document in documents:
+
+            try:
+                file_path = getattr(
+                    document,
+                    "file_path",
+                    None
+                )
+
+                content = getattr(
+                    document,
+                    "content",
+                    None
+                )
+
+                language = getattr(
+                    document,
+                    "language",
+                    None
+                )
+
+                if not file_path:
+                    logger.debug(
+                        "[Graph] Skipping document without file_path"
+                    )
+                    continue
+
+                if content is None:
+                    logger.debug(
+                        f"[Graph] Skipping empty document: "
+                        f"{file_path}"
+                    )
+                    continue
+
+                if not language:
+                    logger.debug(
+                        f"[Graph] Skipping document without language: "
+                        f"{file_path}"
+                    )
+                    continue
+
+                language = str(language).lower().strip()
+
+                parser = get_tree_sitter_parser(
+                    language
+                )
+
+                if parser is None:
+                    logger.debug(
+                        f"[Graph] No Tree-sitter parser for "
+                        f"{file_path} ({language})"
+                    )
+                    continue
+
+                source_bytes = content.encode(
+                    "utf-8"
+                )
+
+                tree = parser.parse(
+                    source_bytes
+                )
+
+                parsed_documents.append(
+                    (
+                        document,
+                        tree,
+                        source_bytes,
+                        language
+                    )
+                )
+
+                # ------------------------------------------------
+                # Add FILE node
+                # ------------------------------------------------
+
+                self._add_file_node(
+                    document
+                )
+
+                # ------------------------------------------------
+                # Register classes/functions/methods
+                # ------------------------------------------------
+
+                self._register_definitions(
+                    tree.root_node,
+                    document,
+                    source_bytes,
+                    language
+                )
+
+            except Exception as exc:
+
+                logger.exception(
+                    f"[Graph] Failed parsing "
+                    f"{getattr(document, 'file_path', 'unknown')}: "
+                    f"{exc}"
+                )
+
+        logger.info(
+            f"[Graph] Pass 1 complete: "
+            f"{self.graph.number_of_nodes()} nodes"
+        )
+
+        # ========================================================
+        # PASS 2
+        # Extract CALLS / IMPORTS / inheritance.
+        # ========================================================
+
+        for (
+            document,
+            tree,
+            source_bytes,
+            language
+        ) in parsed_documents:
+
+            try:
+
+                self._extract_relationships(
+                    tree.root_node,
+                    document,
+                    source_bytes,
+                    language
+                )
+
+            except Exception as exc:
+
+                logger.exception(
+                    f"[Graph] Relationship extraction failed for "
+                    f"{document.file_path}: {exc}"
+                )
+
+        logger.info(
+            f"[Graph] Graph construction complete: "
+            f"{self.graph.number_of_nodes()} nodes, "
+            f"{self.graph.number_of_edges()} edges"
+        )
+
+        logger.info(
+            f"[Graph] Summary: {self.get_summary()}"
+        )
+
+        return self.graph
+
+    # ============================================================
+    # RESET
+    # ============================================================
+
+    def _reset(self):
 
         self.graph.clear()
 
-        self.graph.add_node(
-            repo_name,
-            type="REPOSITORY"
+        self.symbols_by_name.clear()
+        self.functions_by_name.clear()
+        self.classes_by_name.clear()
+        self.methods_by_class.clear()
+        self.symbols_by_file_name.clear()
+        self.symbols_by_qualified_name.clear()
+
+    # ============================================================
+    # FILE NODE
+    # ============================================================
+
+    def _add_file_node(
+        self,
+        document
+    ):
+
+        file_path = self._normalize_path(
+            getattr(
+                document,
+                "file_path",
+                ""
+            )
         )
 
-        class_type_map = {}
-        field_type_map = {}
+        if not file_path:
+            return
+
+        file_id = self._file_id(
+            file_path
+        )
+
+        content = getattr(
+            document,
+            "content",
+            ""
+        )
+
+        self.graph.add_node(
+            file_id,
+            type="FILE",
+            name=Path(file_path).name,
+            qualified_name=file_path,
+            file=file_path,
+            language=getattr(
+                document,
+                "language",
+                None
+            ),
+            line_start=1,
+            line_end=content.count("\n") + 1,
+            code_content=content
+        )
+
+    # ============================================================
+    # DEFINITION REGISTRATION
+    # ============================================================
+
+    def _register_definitions(
+        self,
+        node,
+        document,
+        source_bytes: bytes,
+        language: str,
+        current_class: Optional[str] = None,
+        current_class_id: Optional[str] = None
+    ):
+        """
+        Recursively discover classes, functions and methods.
+
+        IMPORTANT:
+        This pass only registers definitions.
+
+        CALLS are extracted later after every symbol is known.
+        """
+
+        node_type = node.type
+
+        file_path = self._normalize_path(
+            document.file_path
+        )
 
         # ========================================================
-        # PHASE 1
-        # Register classes, interfaces, inheritance and fields
+        # CLASS
         # ========================================================
 
-        for file_path, symbols in extracted_data:
+        if node_type in {
+            "class_definition",
+            "class_declaration"
+        }:
 
-            package = symbols.get(
-                "package",
-                "default"
+            name = self._node_name(
+                node
             )
 
-            file_str = (
-                file_path.name
-                if isinstance(file_path, Path)
-                else str(file_path)
+            if name:
+
+                class_id = self._class_id(
+                    file_path,
+                    name,
+                    node.start_point[0] + 1
+                )
+
+                self._add_symbol_node(
+                    class_id,
+                    "CLASS",
+                    name,
+                    document,
+                    node,
+                    current_class=None
+                )
+
+                parent_id = (
+                    current_class_id
+                    if current_class_id
+                    else self._file_id(file_path)
+                )
+
+                self._add_contains(
+                    parent_id,
+                    class_id
+                )
+
+                self._register_class_indexes(
+                    name,
+                    class_id,
+                    file_path
+                )
+
+                # Continue inside class.
+                for child in node.children:
+
+                    self._register_definitions(
+                        child,
+                        document,
+                        source_bytes,
+                        language,
+                        current_class=name,
+                        current_class_id=class_id
+                    )
+
+                return
+
+        # ========================================================
+        # INTERFACE
+        # ========================================================
+
+        if node_type == "interface_declaration":
+
+            name = self._node_name(
+                node
             )
 
-            # ----------------------------------------------------
-            # Classes
-            # ----------------------------------------------------
+            if name:
 
-            for cls in symbols.get(
-                "classes",
-                []
-            ):
-
-                cls_name = cls["name"]
-
-                class_type_map[
-                    cls_name
-                ] = package
-
-                self.graph.add_node(
-                    cls_name,
-                    type="CLASS",
-                    package=package,
-                    annotations=json.dumps(
-                        cls.get(
-                            "annotations",
-                            []
-                        )
-                    ),
-                    file=file_str,
+                interface_id = self._class_id(
+                    file_path,
+                    name,
+                    node.start_point[0] + 1
                 )
 
-                self.graph.add_edge(
-                    repo_name,
-                    cls_name,
-                    relation="CONTAINS"
+                self._add_symbol_node(
+                    interface_id,
+                    "INTERFACE",
+                    name,
+                    document,
+                    node,
+                    current_class=None
                 )
 
-                # Inheritance
-                if cls.get("extends"):
-
-                    parent = cls["extends"]
-
-                    self.graph.add_node(
-                        parent,
-                        type="CLASS"
-                    )
-
-                    self.graph.add_edge(
-                        cls_name,
-                        parent,
-                        relation="EXTENDS"
-                    )
-
-                # Interfaces
-                for iface in cls.get(
-                    "implements",
-                    []
-                ):
-
-                    self.graph.add_node(
-                        iface,
-                        type="INTERFACE"
-                    )
-
-                    self.graph.add_edge(
-                        cls_name,
-                        iface,
-                        relation="IMPLEMENTS"
-                    )
-
-            # ----------------------------------------------------
-            # Interfaces
-            # ----------------------------------------------------
-
-            for iface in symbols.get(
-                "interfaces",
-                []
-            ):
-
-                self.graph.add_node(
-                    iface,
-                    type="INTERFACE",
-                    package=package,
-                    file=file_str,
+                parent_id = (
+                    current_class_id
+                    if current_class_id
+                    else self._file_id(file_path)
                 )
 
-                self.graph.add_edge(
-                    repo_name,
-                    iface,
-                    relation="CONTAINS"
+                self._add_contains(
+                    parent_id,
+                    interface_id
                 )
 
-            # ----------------------------------------------------
-            # Fields / Dependencies
-            # ----------------------------------------------------
-
-            for field in symbols.get(
-                "fields",
-                []
-            ):
-
-                enclosing = field[
-                    "enclosing_class"
-                ]
-
-                field_name = field[
-                    "name"
-                ]
-
-                field_type = field[
-                    "type"
-                ]
-
-                annotations = field.get(
-                    "annotations",
-                    []
+                self._register_class_indexes(
+                    name,
+                    interface_id,
+                    file_path
                 )
 
-                field_type_map[
-                    (enclosing, field_name)
-                ] = field_type
+                for child in node.children:
 
-                is_injected = any(
-                    any(
-                        keyword in annotation
-                        for keyword in [
-                            "@Autowired",
-                            "@Inject",
-                            "@Resource",
-                        ]
-                    )
-                    for annotation in annotations
-                )
-
-                if (
-                    is_injected
-                    or field_type in class_type_map
-                ):
-
-                    self.graph.add_node(
-                        field_type,
-                        type="CLASS"
+                    self._register_definitions(
+                        child,
+                        document,
+                        source_bytes,
+                        language,
+                        current_class=name,
+                        current_class_id=interface_id
                     )
 
-                    self.graph.add_edge(
-                        enclosing,
-                        field_type,
-                        relation="INJECTS",
-                        field_name=field_name,
-                        annotations=json.dumps(
-                            annotations
-                        ),
-                    )
+                return
 
         # ========================================================
-        # PHASE 2
-        # Methods and method calls
+        # PYTHON FUNCTION / METHOD
         # ========================================================
 
-        method_lookup = {}
+        if (
+            language == "python"
+            and node_type in {
+                "function_definition",
+                "async_function_definition"
+            }
+        ):
 
-        # --------------------------------------------------------
-        # Register all methods FIRST
-        # --------------------------------------------------------
+            name = self._node_name(
+                node
+            )
 
-        for file_path, symbols in extracted_data:
+            if name:
 
-            for method in symbols.get(
-                "methods",
-                []
-            ):
+                if current_class:
 
-                method_name = method[
-                    "name"
-                ]
+                    symbol_type = "METHOD"
 
-                enclosing = method.get(
-                    "enclosing_class"
-                )
-
-                if not enclosing:
-                    continue
-
-                method_node_id = (
-                    f"{enclosing}.{method_name}()"
-                )
-
-                self.graph.add_node(
-                    method_node_id,
-                    type="METHOD",
-                    name=method_name,
-                    class_name=enclosing,
-                    annotations=json.dumps(
-                        method.get(
-                            "annotations",
-                            []
-                        )
-                    ),
-                    file=str(file_path),
-                    line_start=method.get(
-                        "start_line",
-                        1
-                    ),
-                    line_end=method.get(
-                        "end_line",
-                        1
-                    ),
-                    code_content=method.get(
-                        "source_code",
-                        ""
-                    ),
-                )
-
-                self.graph.add_edge(
-                    enclosing,
-                    method_node_id,
-                    relation="HAS_METHOD"
-                )
-
-                method_lookup.setdefault(
-                    method_name,
-                    []
-                ).append(
-                    method_node_id
-                )
-
-        # --------------------------------------------------------
-        # Resolve method calls
-        # --------------------------------------------------------
-
-        for file_path, symbols in extracted_data:
-
-            for call in symbols.get(
-                "method_calls",
-                []
-            ):
-
-                caller_class = call.get(
-                    "caller_class"
-                )
-
-                caller_method = call.get(
-                    "caller_method"
-                )
-
-                obj_expr = call.get(
-                    "object_expression"
-                )
-
-                method_called = call.get(
-                    "method_called"
-                )
-
-                if not caller_class or not method_called:
-                    continue
-
-                # Try to identify the actual caller method
-                caller_id = None
-
-                if caller_method:
-
-                    possible_caller = (
-                        f"{caller_class}.{caller_method}()"
+                    symbol_id = self._method_id(
+                        file_path,
+                        current_class,
+                        name,
+                        node.start_point[0] + 1
                     )
 
-                    if self.graph.has_node(
-                        possible_caller
-                    ):
-                        caller_id = possible_caller
-
-                # If caller method is unavailable,
-                # fall back to class-level CALLS edge.
-                if not caller_id:
-                    caller_id = caller_class
-
-                target_class = None
-
-                # ------------------------------------------------
-                # Resolve object expression through fields
-                # ------------------------------------------------
-
-                if (
-                    obj_expr
-                    and
-                    (
-                        caller_class,
-                        obj_expr
-                    ) in field_type_map
-                ):
-
-                    target_class = field_type_map[
-                        (
-                            caller_class,
-                            obj_expr
-                        )
-                    ]
-
-                # ------------------------------------------------
-                # Direct class reference
-                # ------------------------------------------------
-
-                elif (
-                    obj_expr
-                    and
-                    obj_expr in class_type_map
-                ):
-
-                    target_class = obj_expr
-
-                # ------------------------------------------------
-                # Resolve target
-                # ------------------------------------------------
-
-                if target_class:
-
-                    target_method_id = (
-                        f"{target_class}.{method_called}()"
-                    )
-
-                    if not self.graph.has_node(
-                        target_method_id
-                    ):
-
-                        self.graph.add_node(
-                            target_method_id,
-                            type="METHOD",
-                            name=method_called,
-                            class_name=target_class,
-                        )
-
-                    self.graph.add_edge(
-                        caller_id,
-                        target_method_id,
-                        relation="CALLS"
-                    )
+                    parent_id = current_class_id
 
                 else:
 
-                    # Try method-name lookup
-                    candidates = method_lookup.get(
-                        method_called,
-                        []
+                    symbol_type = "FUNCTION"
+
+                    symbol_id = self._function_id(
+                        file_path,
+                        name,
+                        node.start_point[0] + 1
                     )
 
-                    if len(candidates) == 1:
+                    parent_id = self._file_id(
+                        file_path
+                    )
 
-                        self.graph.add_edge(
-                            caller_id,
-                            candidates[0],
-                            relation="CALLS"
-                        )
+                self._add_symbol_node(
+                    symbol_id,
+                    symbol_type,
+                    name,
+                    document,
+                    node,
+                    current_class=current_class
+                )
 
-                    else:
+                self._add_contains(
+                    parent_id,
+                    symbol_id
+                )
 
-                        unresolved_id = (
-                            f"{method_called}()"
-                        )
+                self._register_symbol_indexes(
+                    name,
+                    symbol_id,
+                    file_path
+                )
 
-                        self.graph.add_node(
-                            unresolved_id,
-                            type="METHOD_CALL",
-                            name=method_called,
-                        )
+                if current_class:
 
-                        self.graph.add_edge(
-                            caller_id,
-                            unresolved_id,
-                            relation="CALLS"
-                        )
+                    self._register_method_index(
+                        current_class,
+                        name,
+                        symbol_id
+                    )
+
+                # Do NOT return before scanning nested definitions.
+                for child in node.children:
+
+                    self._register_definitions(
+                        child,
+                        document,
+                        source_bytes,
+                        language,
+                        current_class=current_class,
+                        current_class_id=current_class_id
+                    )
+
+                return
+
+        # ========================================================
+        # JAVA METHOD / CONSTRUCTOR
+        # ========================================================
+
+        if node_type in {
+            "method_declaration",
+            "constructor_declaration"
+        }:
+
+            name = self._node_name(
+                node
+            )
+
+            if not name:
+                name = "constructor"
+
+            if current_class:
+
+                symbol_type = (
+                    "CONSTRUCTOR"
+                    if node_type == "constructor_declaration"
+                    else "METHOD"
+                )
+
+                symbol_id = self._method_id(
+                    file_path,
+                    current_class,
+                    name,
+                    node.start_point[0] + 1
+                )
+
+                parent_id = current_class_id
+
+            else:
+
+                symbol_type = "FUNCTION"
+
+                symbol_id = self._function_id(
+                    file_path,
+                    name,
+                    node.start_point[0] + 1
+                )
+
+                parent_id = self._file_id(
+                    file_path
+                )
+
+            self._add_symbol_node(
+                symbol_id,
+                symbol_type,
+                name,
+                document,
+                node,
+                current_class=current_class
+            )
+
+            self._add_contains(
+                parent_id,
+                symbol_id
+            )
+
+            self._register_symbol_indexes(
+                name,
+                symbol_id,
+                file_path
+            )
+
+            if current_class:
+
+                self._register_method_index(
+                    current_class,
+                    name,
+                    symbol_id
+                )
+
+            for child in node.children:
+
+                self._register_definitions(
+                    child,
+                    document,
+                    source_bytes,
+                    language,
+                    current_class=current_class,
+                    current_class_id=current_class_id
+                )
+
+            return
+
+        # ========================================================
+        # JAVASCRIPT / TYPESCRIPT FUNCTION
+        # ========================================================
+
+        if node_type in {
+            "function_declaration",
+            "generator_function_declaration",
+            "function"
+        }:
+
+            name = self._node_name(
+                node
+            )
+
+            if name:
+
+                if current_class:
+
+                    symbol_type = "METHOD"
+
+                    symbol_id = self._method_id(
+                        file_path,
+                        current_class,
+                        name,
+                        node.start_point[0] + 1
+                    )
+
+                    parent_id = current_class_id
+
+                else:
+
+                    symbol_type = "FUNCTION"
+
+                    symbol_id = self._function_id(
+                        file_path,
+                        name,
+                        node.start_point[0] + 1
+                    )
+
+                    parent_id = self._file_id(
+                        file_path
+                    )
+
+                self._add_symbol_node(
+                    symbol_id,
+                    symbol_type,
+                    name,
+                    document,
+                    node,
+                    current_class=current_class
+                )
+
+                self._add_contains(
+                    parent_id,
+                    symbol_id
+                )
+
+                self._register_symbol_indexes(
+                    name,
+                    symbol_id,
+                    file_path
+                )
+
+                if current_class:
+
+                    self._register_method_index(
+                        current_class,
+                        name,
+                        symbol_id
+                    )
+
+                for child in node.children:
+
+                    self._register_definitions(
+                        child,
+                        document,
+                        source_bytes,
+                        language,
+                        current_class=current_class,
+                        current_class_id=current_class_id
+                    )
+
+                return
+
+        # ========================================================
+        # JAVASCRIPT / TYPESCRIPT METHOD
+        # ========================================================
+
+        if node_type == "method_definition":
+
+            name = self._node_name(
+                node
+            )
+
+            if name and current_class:
+
+                symbol_id = self._method_id(
+                    file_path,
+                    current_class,
+                    name,
+                    node.start_point[0] + 1
+                )
+
+                self._add_symbol_node(
+                    symbol_id,
+                    "METHOD",
+                    name,
+                    document,
+                    node,
+                    current_class=current_class
+                )
+
+                self._add_contains(
+                    current_class_id,
+                    symbol_id
+                )
+
+                self._register_symbol_indexes(
+                    name,
+                    symbol_id,
+                    file_path
+                )
+
+                self._register_method_index(
+                    current_class,
+                    name,
+                    symbol_id
+                )
+
+                for child in node.children:
+
+                    self._register_definitions(
+                        child,
+                        document,
+                        source_bytes,
+                        language,
+                        current_class=current_class,
+                        current_class_id=current_class_id
+                    )
+
+                return
+
+        # ========================================================
+        # GENERIC RECURSION
+        # ========================================================
+
+        for child in node.children:
+
+            self._register_definitions(
+                child,
+                document,
+                source_bytes,
+                language,
+                current_class=current_class,
+                current_class_id=current_class_id
+            )
 
     # ============================================================
-    # CHUNK-BASED GRAPH
+    # RELATIONSHIP EXTRACTION
     # ============================================================
 
-    def build_graph_from_chunks(
+    def _extract_relationships(
         self,
-        chunks: List[Dict[str, Any]]
+        node,
+        document,
+        source_bytes: bytes,
+        language: str,
+        current_callable: Optional[str] = None,
+        current_class: Optional[str] = None
     ):
-        """
-        Build graph from CodeChunker output.
 
-        This is the method currently used by api.py.
-        """
+        node_type = node.type
 
-        self.graph.clear()
-
-        repo_node = "CodeRepository"
-
-        self.graph.add_node(
-            repo_node,
-            type="REPOSITORY"
-        )
+        callable_id = current_callable
+        class_name = current_class
 
         # ========================================================
-        # PHASE 1
-        # Register ALL classes and methods
+        # Detect current class
         # ========================================================
 
-        method_lookup = {}
+        if node_type in {
+            "class_definition",
+            "class_declaration",
+            "interface_declaration"
+        }:
 
-        for chunk in chunks:
+            name = self._node_name(
+                node
+            )
 
-            file_name = chunk.get(
-                "file_name",
-                chunk.get(
-                    "file",
-                    "unknown"
+            if name:
+                class_name = name
+
+        # ========================================================
+        # Detect current callable
+        # ========================================================
+
+        if node_type in {
+            "function_definition",
+            "async_function_definition",
+            "function_declaration",
+            "generator_function_declaration",
+            "function",
+            "method_declaration",
+            "method_definition",
+            "constructor_declaration"
+        }:
+
+            callable_id = self._find_symbol_at_location(
+                document.file_path,
+                node.start_point[0] + 1,
+                {
+                    "FUNCTION",
+                    "METHOD",
+                    "CONSTRUCTOR"
+                }
+            )
+
+        # ========================================================
+        # CALL
+        # ========================================================
+
+        if node_type in {
+            "call",
+            "call_expression",
+            "method_invocation"
+        }:
+
+            if callable_id:
+
+                target_name, receiver = (
+                    self._extract_call_target(
+                        node,
+                        language,
+                        source_bytes
+                    )
+                )
+
+                if target_name:
+
+                    target_id = (
+                        self._resolve_call_target(
+                            target_name=target_name,
+                            receiver=receiver,
+                            source_file=document.file_path,
+                            current_class=class_name,
+                            language=language
+                        )
+                    )
+
+                    if (
+                        target_id
+                        and target_id != callable_id
+                    ):
+
+                        self.graph.add_edge(
+                            callable_id,
+                            target_id,
+                            relation="CALLS"
+                        )
+
+                        logger.debug(
+                            f"[Graph] CALLS: "
+                            f"{self.graph.nodes[callable_id].get('qualified_name')} "
+                            f"-> "
+                            f"{self.graph.nodes[target_id].get('qualified_name')}"
+                        )
+
+        # ========================================================
+        # IMPORT
+        # ========================================================
+
+        if node_type in {
+            "import_statement",
+            "import_declaration",
+            "import_from_statement"
+        }:
+
+            self._extract_import(
+                node,
+                document,
+                language,
+                source_bytes
+            )
+
+        # ========================================================
+        # RECURSE
+        # ========================================================
+
+        for child in node.children:
+
+            self._extract_relationships(
+                child,
+                document,
+                source_bytes,
+                language,
+                current_callable=callable_id,
+                current_class=class_name
+            )
+
+    # ============================================================
+    # CALL TARGET EXTRACTION
+    # ============================================================
+
+    def _extract_call_target(
+        self,
+        node,
+        language: str,
+        source_bytes: bytes
+    ) -> Tuple[
+        Optional[str],
+        Optional[str]
+    ]:
+
+        # ========================================================
+        # PYTHON
+        # ========================================================
+
+        if language == "python":
+
+            function_node = (
+                node.child_by_field_name(
+                    "function"
                 )
             )
 
-            class_name = chunk.get(
-                "class_name",
-                "Global"
+            if not function_node:
+                return None, None
+
+            text = self._node_text(
+                function_node,
+                source_bytes
+            ).strip()
+
+            if not text:
+                return None, None
+
+            # self.foo()
+            # obj.foo()
+            # module.foo()
+
+            if "." in text:
+
+                parts = text.split(".")
+
+                return (
+                    parts[-1],
+                    ".".join(parts[:-1])
+                )
+
+            return text, None
+
+        # ========================================================
+        # JAVASCRIPT / TYPESCRIPT
+        # ========================================================
+
+        if language in {
+            "javascript",
+            "typescript"
+        }:
+
+            function_node = (
+                node.child_by_field_name(
+                    "function"
+                )
             )
 
-            method_name = chunk.get(
-                "method_name",
-                "unknown"
+            if not function_node:
+                return None, None
+
+            if function_node.type == "identifier":
+
+                return (
+                    self._node_text(
+                        function_node,
+                        source_bytes
+                    ),
+                    None
+                )
+
+            if function_node.type in {
+                "member_expression",
+                "optional_member_expression"
+            }:
+
+                property_node = (
+                    function_node.child_by_field_name(
+                        "property"
+                    )
+                )
+
+                object_node = (
+                    function_node.child_by_field_name(
+                        "object"
+                    )
+                )
+
+                if property_node:
+
+                    target_name = (
+                        self._node_text(
+                            property_node,
+                            source_bytes
+                        )
+                    )
+
+                    receiver = (
+                        self._node_text(
+                            object_node,
+                            source_bytes
+                        )
+                        if object_node
+                        else None
+                    )
+
+                    return (
+                        target_name,
+                        receiver
+                    )
+
+        # ========================================================
+        # JAVA
+        # ========================================================
+
+        if language == "java":
+
+            name_node = (
+                node.child_by_field_name(
+                    "name"
+                )
             )
 
-            # ----------------------------------------------------
-            # Class node
-            # ----------------------------------------------------
+            if not name_node:
+                return None, None
 
-            self.graph.add_node(
-                class_name,
-                type="CLASS",
-                file=file_name,
+            target_name = self._node_text(
+                name_node,
+                source_bytes
             )
+
+            object_node = (
+                node.child_by_field_name(
+                    "object"
+                )
+            )
+
+            receiver = (
+                self._node_text(
+                    object_node,
+                    source_bytes
+                )
+                if object_node
+                else None
+            )
+
+            return (
+                target_name,
+                receiver
+            )
+
+        return None, None
+
+    # ============================================================
+    # CALL RESOLUTION
+    # ============================================================
+
+    def _resolve_call_target(
+        self,
+        target_name: str,
+        receiver: Optional[str],
+        source_file,
+        current_class: Optional[str],
+        language: str
+    ) -> Optional[str]:
+
+        target_name = target_name.strip()
+
+        if not target_name:
+            return None
+
+        # ========================================================
+        # self.foo() / this.foo()
+        # ========================================================
+
+        if receiver in {
+            "self",
+            "this"
+        } and current_class:
+
+            candidates = (
+                self.methods_by_class.get(
+                    (
+                        current_class,
+                        target_name
+                    ),
+                    []
+                )
+            )
+
+            if candidates:
+                return candidates[0]
+
+        # ========================================================
+        # ClassName.foo()
+        # ========================================================
+
+        if receiver:
+
+            receiver_clean = (
+                receiver.split(".")[-1]
+            )
+
+            class_candidates = (
+                self.classes_by_name.get(
+                    receiver_clean,
+                    []
+                )
+            )
+
+            for class_id in class_candidates:
+
+                attrs = self.graph.nodes.get(
+                    class_id,
+                    {}
+                )
+
+                class_name = attrs.get(
+                    "name"
+                )
+
+                if class_name:
+
+                    candidates = (
+                        self.methods_by_class.get(
+                            (
+                                class_name,
+                                target_name
+                            ),
+                            []
+                        )
+                    )
+
+                    if candidates:
+                        return candidates[0]
+
+        # ========================================================
+        # Same class
+        # ========================================================
+
+        if current_class:
+
+            candidates = (
+                self.methods_by_class.get(
+                    (
+                        current_class,
+                        target_name
+                    ),
+                    []
+                )
+            )
+
+            if candidates:
+                return candidates[0]
+
+        # ========================================================
+        # Same file
+        # ========================================================
+
+        file_name = self._normalize_path(
+            source_file
+        )
+
+        candidates = (
+            self.symbols_by_file_name.get(
+                (
+                    file_name,
+                    target_name
+                ),
+                []
+            )
+        )
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # ========================================================
+        # Globally unique symbol
+        # ========================================================
+
+        candidates = (
+            self.symbols_by_name.get(
+                target_name,
+                []
+            )
+        )
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # ========================================================
+        # Globally unique function
+        # ========================================================
+
+        candidates = (
+            self.functions_by_name.get(
+                target_name,
+                []
+            )
+        )
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        return None
+
+    # ============================================================
+    # IMPORTS
+    # ============================================================
+
+    def _extract_import(
+        self,
+        node,
+        document,
+        language,
+        source_bytes
+    ):
+
+        file_path = self._normalize_path(
+            document.file_path
+        )
+
+        file_id = self._file_id(
+            file_path
+        )
+
+        if file_id not in self.graph:
+            return
+
+        text = self._node_text(
+            node,
+            source_bytes
+        ).strip()
+
+        if not text:
+            return
+
+        imports = self.graph.nodes[
+            file_id
+        ].get(
+            "imports",
+            []
+        )
+
+        if text not in imports:
+
+            imports.append(
+                text
+            )
+
+        self.graph.nodes[
+            file_id
+        ]["imports"] = imports
+
+    # ============================================================
+    # NODE CREATION
+    # ============================================================
+
+    def _add_symbol_node(
+        self,
+        node_id,
+        node_type,
+        name,
+        document,
+        node,
+        current_class=None
+    ):
+
+        file_path = self._normalize_path(
+            document.file_path
+        )
+
+        if current_class:
+
+            qualified_name = (
+                f"{current_class}.{name}"
+            )
+
+        else:
+
+            qualified_name = name
+
+        self.graph.add_node(
+            node_id,
+            type=node_type,
+            name=name,
+            qualified_name=qualified_name,
+            class_name=current_class,
+            file=file_path,
+            language=document.language,
+            line_start=node.start_point[0] + 1,
+            line_end=node.end_point[0] + 1,
+            code_content=self._node_text(
+                node,
+                document.content.encode("utf-8")
+            )
+        )
+
+    def _add_contains(
+        self,
+        parent_id,
+        child_id
+    ):
+
+        if parent_id and child_id:
 
             self.graph.add_edge(
-                repo_node,
-                class_name,
+                parent_id,
+                child_id,
                 relation="CONTAINS"
             )
 
-            # ----------------------------------------------------
-            # Method node
-            # ----------------------------------------------------
+    # ============================================================
+    # INDEXES
+    # ============================================================
 
-            method_id = (
-                f"{class_name}.{method_name}()"
-            )
+    def _register_symbol_indexes(
+        self,
+        name,
+        node_id,
+        file_path
+    ):
 
-            self.graph.add_node(
-                method_id,
-                type="METHOD",
-                name=method_name,
-                class_name=class_name,
-                file=file_name,
-                line_start=chunk.get(
-                    "start_line",
-                    1
-                ),
-                line_end=chunk.get(
-                    "end_line",
-                    1
-                ),
-                code_content=chunk.get(
-                    "code_content",
-                    ""
-                ),
-                annotations=chunk.get(
-                    "annotations",
-                    "[]"
-                ),
-            )
+        self.symbols_by_name.setdefault(
+            name,
+            []
+        ).append(
+            node_id
+        )
 
-            self.graph.add_edge(
-                class_name,
-                method_id,
-                relation="HAS_METHOD"
-            )
+        node_type = self.graph.nodes[
+            node_id
+        ].get(
+            "type"
+        )
 
-            # ----------------------------------------------------
-            # Method lookup
-            # ----------------------------------------------------
+        if node_type == "FUNCTION":
 
-            method_lookup.setdefault(
-                method_name,
+            self.functions_by_name.setdefault(
+                name,
                 []
             ).append(
-                method_id
+                node_id
             )
 
-        # ========================================================
-        # PHASE 2
-        # Resolve CALLS relationships
-        # ========================================================
+        normalized_file = (
+            self._normalize_path(
+                file_path
+            )
+        )
 
-        for chunk in chunks:
+        self.symbols_by_file_name.setdefault(
+            (
+                normalized_file,
+                name
+            ),
+            []
+        ).append(
+            node_id
+        )
 
-            class_name = chunk.get(
-                "class_name",
-                "Global"
+        qualified_name = (
+            self.graph.nodes[node_id].get(
+                "qualified_name"
+            )
+        )
+
+        if qualified_name:
+
+            self.symbols_by_qualified_name.setdefault(
+                qualified_name,
+                []
+            ).append(
+                node_id
             )
 
-            method_name = chunk.get(
-                "method_name",
-                "unknown"
+    def _register_class_indexes(
+        self,
+        name,
+        node_id,
+        file_path
+    ):
+
+        self.classes_by_name.setdefault(
+            name,
+            []
+        ).append(
+            node_id
+        )
+
+        self.symbols_by_name.setdefault(
+            name,
+            []
+        ).append(
+            node_id
+        )
+
+        normalized_file = (
+            self._normalize_path(
+                file_path
+            )
+        )
+
+        self.symbols_by_file_name.setdefault(
+            (
+                normalized_file,
+                name
+            ),
+            []
+        ).append(
+            node_id
+        )
+
+        qualified_name = (
+            self.graph.nodes[node_id].get(
+                "qualified_name"
+            )
+        )
+
+        if qualified_name:
+
+            self.symbols_by_qualified_name.setdefault(
+                qualified_name,
+                []
+            ).append(
+                node_id
             )
 
-            caller_id = (
-                f"{class_name}.{method_name}()"
-            )
+    def _register_method_index(
+        self,
+        class_name,
+        method_name,
+        node_id
+    ):
 
-            if not self.graph.has_node(
-                caller_id
-            ):
-                continue
-
-            # CodeChunker currently stores calls under
-            # "relationships", but support both.
-            calls = (
-                chunk.get("calls")
-                or chunk.get("relationships")
-                or []
-            )
-
-            for call in calls:
-
-                if not call:
-                    continue
-
-                # Handle dictionaries as well as strings
-                if isinstance(call, dict):
-
-                    called_method = (
-                        call.get("method_called")
-                        or call.get("name")
-                        or call.get("method")
-                    )
-
-                    object_expression = (
-                        call.get(
-                            "object_expression"
-                        )
-                    )
-
-                else:
-
-                    called_method = str(
-                        call
-                    )
-
-                    object_expression = None
-
-                if not called_method:
-                    continue
-
-                called_method = (
-                    str(called_method)
-                    .strip()
-                )
-
-                # Remove ()
-                if called_method.endswith(
-                    "()"
-                ):
-                    called_method = (
-                        called_method[:-2]
-                    )
-
-                # ------------------------------------------------
-                # Extract final method name
-                #
-                # Examples:
-                # save
-                # helper.save
-                # this.save
-                # OuterRepository.save
-                # ------------------------------------------------
-
-                method_only = (
-                    called_method
-                    .split(".")[-1]
-                )
-
-                # ------------------------------------------------
-                # Try exact method lookup
-                # ------------------------------------------------
-
-                candidates = method_lookup.get(
-                    method_only,
-                    []
-                )
-
-                # ------------------------------------------------
-                # Exact object/class resolution
-                # ------------------------------------------------
-
-                target = None
-
-                if object_expression:
-
-                    object_name = str(
-                        object_expression
-                    ).strip()
-
-                    # Search for Class.method()
-                    possible_target = (
-                        f"{object_name}.{method_only}()"
-                    )
-
-                    if self.graph.has_node(
-                        possible_target
-                    ):
-                        target = possible_target
-
-                # ------------------------------------------------
-                # Single method candidate
-                # ------------------------------------------------
-
-                if not target and len(
-                    candidates
-                ) == 1:
-
-                    target = candidates[0]
-
-                # ------------------------------------------------
-                # Multiple candidates
-                # ------------------------------------------------
-
-                if not target and len(
-                    candidates
-                ) > 1:
-
-                    # Prefer same class
-                    same_class_target = (
-                        f"{class_name}.{method_only}()"
-                    )
-
-                    if self.graph.has_node(
-                        same_class_target
-                    ):
-
-                        target = (
-                            same_class_target
-                        )
-
-                # ------------------------------------------------
-                # Add resolved CALLS edge
-                # ------------------------------------------------
-
-                if target:
-
-                    self.graph.add_edge(
-                        caller_id,
-                        target,
-                        relation="CALLS"
-                    )
-
-                # ------------------------------------------------
-                # Otherwise unresolved call
-                # ------------------------------------------------
-
-                else:
-
-                    unresolved_id = (
-                        f"{method_only}()"
-                    )
-
-                    self.graph.add_node(
-                        unresolved_id,
-                        type="METHOD_CALL",
-                        name=method_only,
-                    )
-
-                    self.graph.add_edge(
-                        caller_id,
-                        unresolved_id,
-                        relation="CALLS"
-                    )
+        self.methods_by_class.setdefault(
+            (
+                class_name,
+                method_name
+            ),
+            []
+        ).append(
+            node_id
+        )
 
     # ============================================================
-    # METHOD RESOLUTION
+    # CALLER / CALLEE API
+    # ============================================================
+
+    def get_calls_from(
+        self,
+        method_name: str
+    ) -> List[Dict[str, Any]]:
+
+        nodes = self._resolve_method_nodes(
+            method_name
+        )
+
+        results = []
+        seen = set()
+
+        for node_id in nodes:
+
+            if node_id not in self.graph:
+                continue
+
+            for _, target_id, data in self.graph.out_edges(
+                node_id,
+                data=True
+            ):
+
+                if data.get(
+                    "relation"
+                ) != "CALLS":
+                    continue
+
+                if target_id in seen:
+                    continue
+
+                seen.add(
+                    target_id
+                )
+
+                results.append(
+                    self._node_to_result(
+                        target_id
+                    )
+                )
+
+        return results
+
+    def get_callers_of(
+        self,
+        method_name: str
+    ) -> List[Dict[str, Any]]:
+
+        nodes = self._resolve_method_nodes(
+            method_name
+        )
+
+        results = []
+        seen = set()
+
+        for node_id in nodes:
+
+            if node_id not in self.graph:
+                continue
+
+            for source_id, _, data in self.graph.in_edges(
+                node_id,
+                data=True
+            ):
+
+                if data.get(
+                    "relation"
+                ) != "CALLS":
+                    continue
+
+                if source_id in seen:
+                    continue
+
+                seen.add(
+                    source_id
+                )
+
+                results.append(
+                    self._node_to_result(
+                        source_id
+                    )
+                )
+
+        return results
+
+    # ============================================================
+    # RESOLVE METHOD
     # ============================================================
 
     def _resolve_method_nodes(
         self,
         method_name: str
     ) -> List[str]:
-        """
-        Resolve a user-provided method name to actual
-        METHOD nodes.
 
-        Examples:
+        method_name = (
+            method_name.strip()
+        )
 
-            save
-            save()
-            OuterRepository.save
-            OuterRepository.save()
-        """
+        # Exact symbol name.
+        if method_name in self.symbols_by_name:
 
-        if not method_name:
-            return []
+            return self.symbols_by_name[
+                method_name
+            ]
 
-        name = str(
-            method_name
-        ).strip()
-
-        if name.endswith(
-            "()"
-        ):
-            name = name[:-2]
-
-        results = []
-
-        # --------------------------------------------------------
-        # Exact node
-        # --------------------------------------------------------
-
-        if self.graph.has_node(
-            f"{name}()"
+        # Exact qualified name.
+        if method_name in (
+            self.symbols_by_qualified_name
         ):
 
-            node = f"{name}()"
+            return self.symbols_by_qualified_name[
+                method_name
+            ]
 
-            if self.graph.nodes[node].get(
-                "type"
-            ) == "METHOD":
+        # Class.method
+        if "." in method_name:
 
-                results.append(
-                    node
+            class_name, name = (
+                method_name.rsplit(
+                    ".",
+                    1
                 )
+            )
 
-        # --------------------------------------------------------
-        # Search actual METHOD nodes
-        # --------------------------------------------------------
+            candidates = (
+                self.methods_by_class.get(
+                    (
+                        class_name,
+                        name
+                    ),
+                    []
+                )
+            )
 
-        for node, data in self.graph.nodes(
+            if candidates:
+                return candidates
+
+        # Final scan.
+        matches = []
+
+        for node_id, attrs in self.graph.nodes(
             data=True
         ):
 
-            if data.get(
-                "type"
-            ) != "METHOD":
-                continue
-
-            node_str = str(
-                node
-            )
-
-            node_method_name = data.get(
+            if attrs.get(
                 "name"
-            )
+            ) == method_name:
 
-            # Exact method name
-            if node_method_name == name:
+                if attrs.get(
+                    "type"
+                ) in {
+                    "FUNCTION",
+                    "METHOD",
+                    "CONSTRUCTOR"
+                }:
 
-                results.append(
-                    node_str
-                )
-                continue
-
-            # Class.method
-            if node_str == name:
-
-                results.append(
-                    node_str
-                )
-                continue
-
-            # Class.method()
-            if node_str == f"{name}()":
-
-                results.append(
-                    node_str
-                )
-
-        return list(
-            dict.fromkeys(
-                results
-            )
-        )
-
-    # ============================================================
-    # CALLS
-    # ============================================================
-
-    def get_calls_from(
-        self,
-        method_name: str
-    ) -> List[str]:
-
-        targets = self._resolve_method_nodes(
-            method_name
-        )
-
-        if not targets:
-            return []
-
-        results = []
-
-        for target in targets:
-
-            for _, dst, data in self.graph.out_edges(
-                target,
-                data=True
-            ):
-
-                if data.get(
-                    "relation"
-                ) == "CALLS":
-
-                    results.append(
-                        dst
+                    matches.append(
+                        node_id
                     )
 
-        return list(
-            dict.fromkeys(
-                results
-            )
-        )
-
-    # ============================================================
-    # CALLERS
-    # ============================================================
-
-    def get_callers_of(
-        self,
-        method_name: str
-    ) -> List[str]:
-
-        targets = self._resolve_method_nodes(
-            method_name
-        )
-
-        if not targets:
-            return []
-
-        results = []
-
-        for target in targets:
-
-            for src, _, data in self.graph.in_edges(
-                target,
-                data=True
-            ):
-
-                if data.get(
-                    "relation"
-                ) == "CALLS":
-
-                    results.append(
-                        src
-                    )
-
-        return list(
-            dict.fromkeys(
-                results
-            )
-        )
+        return matches
 
     # ============================================================
     # GRAPH SEARCH
@@ -921,236 +1653,150 @@ class CodeKnowledgeGraph:
     def search_graph(
         self,
         query: str,
-        top_k: int = 5,
-        vector_store=None
+        limit: int = 20
     ) -> List[Dict[str, Any]]:
 
-        raw_words = set(
-            re.findall(
-                r"[A-Za-z0-9]+",
-                query
-            )
+        query_lower = (
+            query.lower()
         )
 
-        query_tokens = {
-            word.lower()
-            for word in raw_words
-            if len(word) > 2
-        }
+        results = []
 
-        seed_nodes = set()
-
-        # --------------------------------------------------------
-        # Symbol matching
-        # --------------------------------------------------------
-
-        for node in self.graph.nodes():
-
-            node_str = str(
-                node
-            )
-
-            split_words = set(
-                re.findall(
-                    r"[A-Z]?[a-z]+|"
-                    r"[A-Z]+(?=[A-Z][a-z]|\d|\b)|"
-                    r"[0-9]+",
-                    node_str
-                )
-            )
-
-            node_tokens = {
-                word.lower()
-                for word in split_words
-                if len(word) > 1
-            }
-
-            if (
-                query_tokens.intersection(
-                    node_tokens
-                )
-                or any(
-                    token in node_str.lower()
-                    for token in query_tokens
-                )
-            ):
-
-                seed_nodes.add(
-                    node
-                )
-
-        # --------------------------------------------------------
-        # Vector fallback
-        # --------------------------------------------------------
-
-        if (
-            len(seed_nodes) < 3
-            and vector_store
-            and hasattr(
-                vector_store,
-                "search"
-            )
+        for node_id, attrs in self.graph.nodes(
+            data=True
         ):
 
-            raw_vec = vector_store.search(
-                query,
-                top_k=5
-            )
-
-            for item in raw_vec:
-
-                chunk = (
-                    item[0]
-                    if isinstance(
-                        item,
-                        tuple
-                    )
-                    else item
-                )
-
-                cls = chunk.get(
-                    "class_name"
-                )
-
-                mth = chunk.get(
-                    "method_name"
-                )
-
-                if cls and self.graph.has_node(
-                    cls
-                ):
-
-                    seed_nodes.add(
-                        cls
-                    )
-
-                if cls and mth:
-
-                    method_id = (
-                        f"{cls}.{mth}()"
-                    )
-
-                    if self.graph.has_node(
-                        method_id
-                    ):
-
-                        seed_nodes.add(
-                            method_id
-                        )
-
-        # --------------------------------------------------------
-        # Traverse graph
-        # --------------------------------------------------------
-
-        visited = set()
-
-        matched_chunks = []
-
-        for seed in seed_nodes:
-
-            if seed in visited:
-                continue
-
-            visited.add(
-                seed
-            )
-
-            node_attrs = (
-                self.graph.nodes[
-                    seed
-                ]
-            )
-
-            chunk_dict = {
-                "id": seed,
-                "class_name": (
-                    seed
-                    if node_attrs.get(
-                        "type"
-                    ) == "CLASS"
-                    else str(seed).split(
-                        "."
-                    )[0]
-                ),
-                "method_name": (
-                    node_attrs.get(
-                        "name"
-                    )
-                    or str(seed)
-                    .split(".")[-1]
-                    .replace(
-                        "()",
+            searchable = " ".join(
+                str(
+                    attrs.get(
+                        key,
                         ""
                     )
-                ),
-                "file_name": node_attrs.get(
+                )
+                for key in [
+                    "name",
+                    "qualified_name",
                     "file",
-                    ""
-                ),
-                "node_type": node_attrs.get(
-                    "type",
-                    "UNKNOWN"
-                ),
+                    "type"
+                ]
+            ).lower()
+
+            if query_lower in searchable:
+
+                results.append(
+                    self._node_to_result(
+                        node_id
+                    )
+                )
+
+                if len(results) >= limit:
+                    break
+
+        return results
+
+    # ============================================================
+    # CLASS HELPERS
+    # ============================================================
+
+    def get_class_methods(
+        self,
+        class_name: str
+    ) -> List[Dict[str, Any]]:
+
+        return [
+            self._node_to_result(
+                node_id
+            )
+            for node_id in self.methods_by_class.get(
+                class_name,
+                []
+            )
+        ]
+
+    def get_class_containing(
+        self,
+        method_name: str
+    ) -> Optional[Dict[str, Any]]:
+
+        nodes = self._resolve_method_nodes(
+            method_name
+        )
+
+        for node_id in nodes:
+
+            attrs = self.graph.nodes.get(
+                node_id,
+                {}
+            )
+
+            class_name = attrs.get(
+                "class_name"
+            )
+
+            if class_name:
+
+                candidates = (
+                    self.classes_by_name.get(
+                        class_name,
+                        []
+                    )
+                )
+
+                if candidates:
+
+                    return self._node_to_result(
+                        candidates[0]
+                    )
+
+        return None
+
+    def inspect_class_dependencies(
+        self,
+        class_name: str
+    ) -> Dict[str, Any]:
+
+        classes = self.classes_by_name.get(
+            class_name,
+            []
+        )
+
+        if not classes:
+
+            return {
+                "class": class_name,
+                "dependencies": []
             }
 
-            matched_chunks.append(
-                chunk_dict
+        class_id = classes[0]
+
+        dependencies = []
+
+        for _, target_id, data in self.graph.out_edges(
+            class_id,
+            data=True
+        ):
+
+            relation = data.get(
+                "relation"
             )
 
-            for neighbor in self.graph.successors(
-                seed
-            ):
+            if relation in {
+                "CALLS",
+                "IMPORTS",
+                "EXTENDS",
+                "IMPLEMENTS"
+            }:
 
-                if neighbor in visited:
-                    continue
-
-                visited.add(
-                    neighbor
+                dependencies.append(
+                    self._node_to_result(
+                        target_id
+                    )
                 )
 
-                attrs = (
-                    self.graph.nodes[
-                        neighbor
-                    ]
-                )
-
-                matched_chunks.append({
-                    "id": neighbor,
-                    "class_name": (
-                        neighbor
-                        if attrs.get(
-                            "type"
-                        ) == "CLASS"
-                        else str(
-                            neighbor
-                        ).split(".")[0]
-                    ),
-                    "method_name": (
-                        attrs.get(
-                            "name"
-                        )
-                        or str(
-                            neighbor
-                        )
-                        .split(".")[-1]
-                        .replace(
-                            "()",
-                            ""
-                        )
-                    ),
-                    "file_name": attrs.get(
-                        "file",
-                        ""
-                    ),
-                    "node_type": attrs.get(
-                        "type",
-                        "UNKNOWN"
-                    ),
-                })
-
-        return matched_chunks[
-            :top_k
-        ]
+        return {
+            "class": class_name,
+            "dependencies": dependencies
+        }
 
     # ============================================================
     # SUMMARY
@@ -1158,18 +1804,26 @@ class CodeKnowledgeGraph:
 
     def get_summary(
         self
-    ) -> dict:
+    ) -> Dict[str, Any]:
 
         return {
-            "total_nodes": self.graph.number_of_nodes(),
-            "total_edges": self.graph.number_of_edges(),
-            "node_types": self._count_node_types(),
-            "relationship_types": self._count_edge_relations(),
+            "total_nodes": (
+                self.graph.number_of_nodes()
+            ),
+            "total_edges": (
+                self.graph.number_of_edges()
+            ),
+            "node_types": (
+                self._count_node_types()
+            ),
+            "relationship_types": (
+                self._count_edge_relations()
+            )
         }
 
     def _count_node_types(
         self
-    ) -> dict:
+    ):
 
         counts = {}
 
@@ -1193,7 +1847,7 @@ class CodeKnowledgeGraph:
 
     def _count_edge_relations(
         self
-    ) -> dict:
+    ):
 
         counts = {}
 
@@ -1216,147 +1870,359 @@ class CodeKnowledgeGraph:
         return counts
 
     # ============================================================
-    # GRAPH EXPORT
+    # GRAPHML
     # ============================================================
 
     def export_graphml(
         self,
-        output_path: str = (
-            "workspace/code_graph.graphml"
-        )
+        output_path: str
     ):
 
-        out_file = Path(
-            output_path
-        )
+        graph_copy = self.graph.copy()
 
-        out_file.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        nx.write_graphml(
-            self.graph,
-            out_file
-        )
-
-        print(
-            "[Graph] Exported GraphML to: "
-            f"{out_file.resolve()}"
-        )
-
-    # ============================================================
-    # CLASS METHODS
-    # ============================================================
-
-    def get_class_methods(
-        self,
-        class_name: str
-    ) -> List[str]:
-
-        if not self.graph.has_node(
-            class_name
-        ):
-            return []
-
-        return [
-            dst
-            for _, dst, data in self.graph.out_edges(
-                class_name,
-                data=True
-            )
-            if data.get(
-                "relation"
-            ) == "HAS_METHOD"
-        ]
-
-    # ============================================================
-    # FIND CLASS CONTAINING METHOD
-    # ============================================================
-
-    def get_class_containing(
-        self,
-        method_name: str
-    ) -> List[str]:
-
-        results = []
-
-        for src, dst, data in self.graph.edges(
+        for _, attrs in graph_copy.nodes(
             data=True
         ):
 
-            if data.get(
-                "relation"
-            ) == "HAS_METHOD":
+            for key, value in list(
+                attrs.items()
+            ):
 
-                if method_name in str(
-                    dst
+                if isinstance(
+                    value,
+                    (
+                        list,
+                        dict,
+                        tuple,
+                        set
+                    )
                 ):
 
-                    results.append(
-                        src
+                    attrs[key] = str(
+                        value
                     )
 
-        return list(
-            set(
-                results
-            )
+        for _, _, attrs in graph_copy.edges(
+            data=True
+        ):
+
+            for key, value in list(
+                attrs.items()
+            ):
+
+                if isinstance(
+                    value,
+                    (
+                        list,
+                        dict,
+                        tuple,
+                        set
+                    )
+                ):
+
+                    attrs[key] = str(
+                        value
+                    )
+
+        nx.write_graphml(
+            graph_copy,
+            output_path
         )
 
     # ============================================================
-    # CLASS DEPENDENCIES
+    # LOCATION RESOLUTION
     # ============================================================
 
-    def inspect_class_dependencies(
+    def _find_symbol_at_location(
         self,
-        class_name: str
-    ) -> dict:
+        file_path,
+        line,
+        allowed_types
+    ) -> Optional[str]:
 
-        if class_name not in self.graph:
+        normalized = (
+            self._normalize_path(
+                file_path
+            )
+        )
 
-            return {
-                "error": (
-                    f"Class '{class_name}' "
-                    "not in graph."
-                )
-            }
+        candidates = []
 
-        relations = {
-            "HAS_METHOD": [],
-            "INJECTS": [],
-            "CALLS": [],
-            "EXTENDS": [],
-            "IMPLEMENTS": [],
-        }
-
-        for successor in self.graph.successors(
-            class_name
+        for node_id, attrs in self.graph.nodes(
+            data=True
         ):
 
-            edge_data = (
-                self.graph.get_edge_data(
-                    class_name,
-                    successor
+            if attrs.get(
+                "file"
+            ) != normalized:
+
+                continue
+
+            if attrs.get(
+                "type"
+            ) not in allowed_types:
+
+                continue
+
+            line_start = attrs.get(
+                "line_start",
+                0
+            )
+
+            line_end = attrs.get(
+                "line_end",
+                0
+            )
+
+            if (
+                line_start <= line
+                <= line_end
+            ):
+
+                size = (
+                    line_end
+                    - line_start
+                )
+
+                candidates.append(
+                    (
+                        size,
+                        node_id
+                    )
+                )
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: item[0]
+        )
+
+        return candidates[0][1]
+
+    # ============================================================
+    # RESULT
+    # ============================================================
+
+    def _node_to_result(
+        self,
+        node_id: str
+    ) -> Dict[str, Any]:
+
+        attrs = dict(
+            self.graph.nodes.get(
+                node_id,
+                {}
+            )
+        )
+
+        attrs["id"] = node_id
+
+        return attrs
+
+    # ============================================================
+    # TREE-SITTER HELPERS
+    # ============================================================
+
+    @staticmethod
+    def _node_name(
+        node
+    ) -> Optional[str]:
+
+        try:
+
+            name_node = (
+                node.child_by_field_name(
+                    "name"
                 )
             )
 
-            relation = (
-                edge_data.get(
-                    "relation"
-                )
-                if edge_data
-                else None
+            if name_node:
+
+                text = name_node.text
+
+                if isinstance(
+                    text,
+                    bytes
+                ):
+
+                    return text.decode(
+                        "utf-8",
+                        errors="replace"
+                    )
+
+                return str(text)
+
+        except Exception:
+            pass
+
+        # Some grammars use different structures.
+        # Search direct identifier children.
+
+        try:
+
+            for child in node.children:
+
+                if child.type in {
+                    "identifier",
+                    "type_identifier",
+                    "property_identifier"
+                }:
+
+                    text = child.text
+
+                    if isinstance(
+                        text,
+                        bytes
+                    ):
+
+                        return text.decode(
+                            "utf-8",
+                            errors="replace"
+                        )
+
+                    return str(text)
+
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def _node_text(
+        node,
+        source_bytes
+    ) -> str:
+
+        try:
+
+            return source_bytes[
+                node.start_byte:node.end_byte
+            ].decode(
+                "utf-8",
+                errors="replace"
             )
 
-            if relation in relations:
+        except Exception:
 
-                relations[
-                    relation
-                ].append(
-                    successor
-                )
+            return ""
 
-        return {
-            "class": class_name,
-            "relationships": relations,
-        }
+    @staticmethod
+    def _normalize_path(
+        path
+    ) -> str:
+
+        if isinstance(
+            path,
+            Path
+        ):
+
+            path = str(path)
+
+        return str(
+            path
+        ).replace(
+            "\\",
+            "/"
+        )
+
+    # ============================================================
+    # NODE IDS
+    # ============================================================
+
+    @staticmethod
+    def _file_id(
+        file_path
+    ) -> str:
+
+        return (
+            f"file::{file_path}"
+        )
+
+    @staticmethod
+    def _class_id(
+        file_path,
+        name,
+        line
+    ) -> str:
+
+        return (
+            f"class::{file_path}::"
+            f"{name}::{line}"
+        )
+
+    @staticmethod
+    def _function_id(
+        file_path,
+        name,
+        line
+    ) -> str:
+
+        return (
+            f"function::{file_path}::"
+            f"{name}::{line}"
+        )
+
+    @staticmethod
+    def _method_id(
+        file_path,
+        class_name,
+        name,
+        line
+    ) -> str:
+
+        return (
+            f"method::{file_path}::"
+            f"{class_name}::{name}::{line}"
+        )
+
+    # ============================================================
+    # IDENTIFIER EXTRACTION
+    # ============================================================
+
+    @staticmethod
+    def _extract_identifiers(
+        text: str
+    ) -> List[str]:
+
+        return re.findall(
+            r"\b[A-Za-z_][A-Za-z0-9_]*\b",
+            text
+        )
+
+
+# ================================================================
+# BACKWARD COMPATIBILITY
+# ================================================================
+
+def build_graph(
+    repo_name: str,
+    extracted_data: Any
+) -> CodeKnowledgeGraph:
+
+    """
+    Backward-compatible graph builder.
+
+    New code should use:
+
+        CodeKnowledgeGraph().build_graph_from_documents(...)
+    """
+
+    graph = CodeKnowledgeGraph()
+
+    logger.warning(
+        "[Graph] build_graph(extracted_data) is deprecated. "
+        "Use build_graph_from_documents() instead."
+    )
+
+    if isinstance(
+        extracted_data,
+        list
+    ):
+
+        graph.build_graph_from_documents(
+            extracted_data
+        )
+
+    return graph
+

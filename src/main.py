@@ -1,3 +1,4 @@
+
 import shutil
 from pathlib import Path
 from typing import Any, Optional
@@ -12,6 +13,7 @@ from src.multi_ast_parser import CodeParserFactory
 from src.chunker import CodeChunker
 from src.vector_store import VectorStore
 from src.graph_builder import CodeKnowledgeGraph
+from src.data_processing.document_loader import LoadedDocument
 from src.git_intelligence import GitIntelligence
 from src.context_builder import CodeIntelligenceContextBuilder
 from src.llm_engine import CodeIntelligenceEngine
@@ -314,8 +316,6 @@ def index_repository(
 
         # -------------------------------------------------
         # Repository name
-        #
-        # This is used for the FAISS index directory.
         # -------------------------------------------------
 
         repo_name = repo_path.name
@@ -513,10 +513,74 @@ def index_repository(
             "[Index] Building knowledge graph..."
         )
 
+        language_map = {
+            ".py": "python",
+            ".java": "java",
+            ".js": "javascript",
+            ".jsx": "javascript",
+            ".ts": "typescript",
+            ".tsx": "typescript",
+        }
+
+        graph_documents = []
+
+        for source_file, file_data in extracted_data:
+
+            try:
+
+                source_file = Path(
+                    source_file
+                )
+
+                extension = (
+                    source_file.suffix.lower()
+                )
+
+                language = language_map.get(
+                    extension
+                )
+
+                if not language:
+                    continue
+
+                source_code = file_data.get(
+                    "source_code",
+                    "",
+                )
+
+                if not source_code.strip():
+                    continue
+
+                graph_document = LoadedDocument(
+                    file_path=source_file,
+                    absolute_path=source_file.resolve(),
+                    content=source_code,
+                    language=language,
+                    size_bytes=len(
+                        source_code.encode("utf-8")
+                    ),
+                )
+
+                graph_documents.append(
+                    graph_document
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"[Graph] Could not prepare "
+                    f"{source_file}: {exc}"
+                )
+
+        print(
+            f"[Index] Graph documents prepared: "
+            f"{len(graph_documents)}"
+        )
+
         kg = CodeKnowledgeGraph()
 
-        kg.build_graph_from_chunks(
-            chunks
+        kg.build_graph_from_documents(
+            graph_documents
         )
 
         # -------------------------------------------------
@@ -533,9 +597,6 @@ def index_repository(
 
         # -------------------------------------------------
         # Load existing index
-        #
-        # IMPORTANT:
-        # VectorStore.load_index() requires repo_name.
         # -------------------------------------------------
 
         if not payload.rebuild_index:
@@ -572,8 +633,6 @@ def index_repository(
                 chunks
             )
 
-            # IMPORTANT:
-            # save_index() requires repo_name.
             store.save_index(
                 repo_name
             )
@@ -730,7 +789,9 @@ def _safe_name(value: Any) -> str:
     """
     Convert graph values into a stable display name.
     """
+
     if isinstance(value, dict):
+
         return (
             value.get("name")
             or value.get("entity")
@@ -746,11 +807,12 @@ def _build_call_graph_response(
     query: str,
     target: str,
 ) -> StructuredResponse:
-    """Build a structured call-graph response using the knowledge graph."""
+    """Build a structured call-graph response."""
 
     graph = state.graph_db
 
     if not graph:
+
         return StructuredResponse(
             query=query,
             response_type=QueryIntent.CALL_GRAPH.value,
@@ -782,7 +844,11 @@ def _build_call_graph_response(
     edges = []
 
     for caller in callers:
-        caller_name = _safe_name(caller)
+
+        caller_name = _safe_name(
+            caller
+        )
+
         if not caller_name:
             continue
 
@@ -803,7 +869,11 @@ def _build_call_graph_response(
         )
 
     for callee in callees:
-        callee_name = _safe_name(callee)
+
+        callee_name = _safe_name(
+            callee
+        )
+
         if not callee_name:
             continue
 
@@ -824,6 +894,7 @@ def _build_call_graph_response(
         )
 
     unique_nodes = {}
+
     for node in nodes:
         unique_nodes[node["id"]] = node
 
@@ -831,6 +902,7 @@ def _build_call_graph_response(
     seen_edges = set()
 
     for edge in edges:
+
         edge_key = (
             edge["source"],
             edge["target"],
@@ -840,19 +912,37 @@ def _build_call_graph_response(
         if edge_key in seen_edges:
             continue
 
-        seen_edges.add(edge_key)
-        unique_edges.append(edge)
+        seen_edges.add(
+            edge_key
+        )
+
+        unique_edges.append(
+            edge
+        )
 
     if callers and callees:
+
         answer = (
             f"{target} is called by {len(callers)} method(s) "
             f"and calls {len(callees)} method(s)."
         )
+
     elif callers:
-        answer = f"{target} is called by {len(callers)} method(s)."
+
+        answer = (
+            f"{target} is called by "
+            f"{len(callers)} method(s)."
+        )
+
     elif callees:
-        answer = f"{target} calls {len(callees)} method(s)."
+
+        answer = (
+            f"{target} calls "
+            f"{len(callees)} method(s)."
+        )
+
     else:
+
         answer = (
             f"No direct caller or callee relationships were found "
             f"for {target}."
@@ -864,10 +954,18 @@ def _build_call_graph_response(
         answer=answer,
         data={
             "target": target,
-            "nodes": list(unique_nodes.values()),
+            "nodes": list(
+                unique_nodes.values()
+            ),
             "edges": unique_edges,
-            "callers": [_safe_name(caller) for caller in callers],
-            "callees": [_safe_name(callee) for callee in callees],
+            "callers": [
+                _safe_name(caller)
+                for caller in callers
+            ],
+            "callees": [
+                _safe_name(callee)
+                for callee in callees
+            ],
         },
         evidence=[],
     )
@@ -877,11 +975,11 @@ def _build_impact_response(
     query: str,
     target: str,
 ) -> StructuredResponse:
-    """Build a structured impact-analysis response."""
 
     graph = state.graph_db
 
     if not graph:
+
         return StructuredResponse(
             query=query,
             response_type=QueryIntent.IMPACT.value,
@@ -892,11 +990,16 @@ def _build_impact_response(
 
     max_depth = 3
     visited = {target}
-    queue = deque([(target, 0)])
+    queue = deque(
+        [(target, 0)]
+    )
     affected_entities = []
 
     while queue:
-        current_entity, distance = queue.popleft()
+
+        current_entity, distance = (
+            queue.popleft()
+        )
 
         if distance >= max_depth:
             continue
@@ -908,13 +1011,24 @@ def _build_impact_response(
         )
 
         for caller in callers:
-            caller_name = _safe_name(caller)
 
-            if not caller_name or caller_name in visited:
+            caller_name = _safe_name(
+                caller
+            )
+
+            if not caller_name:
                 continue
 
-            visited.add(caller_name)
-            next_distance = distance + 1
+            if caller_name in visited:
+                continue
+
+            visited.add(
+                caller_name
+            )
+
+            next_distance = (
+                distance + 1
+            )
 
             affected_entities.append(
                 {
@@ -923,7 +1037,12 @@ def _build_impact_response(
                 }
             )
 
-            queue.append((caller_name, next_distance))
+            queue.append(
+                (
+                    caller_name,
+                    next_distance,
+                )
+            )
 
     return StructuredResponse(
         query=query,
@@ -946,7 +1065,7 @@ def _run_rag_response(
     query: str,
     top_k: int,
 ):
-    """Run the existing RAG engine without changing its behavior."""
+    """Run the existing RAG engine."""
 
     response = state.engine.answer_query(
         query,
@@ -954,40 +1073,53 @@ def _run_rag_response(
     )
 
     if isinstance(response, dict):
+
         answer = response.get(
             "answer",
             "No response generated.",
         )
+
         retrieved_chunks = response.get(
             "retrieved_chunks",
             [],
         )
+
         context_used = response.get(
             "context",
             {},
         )
+
     else:
+
         answer = str(response)
         retrieved_chunks = []
         context_used = {}
 
-    return answer, retrieved_chunks, context_used
+    return (
+        answer,
+        retrieved_chunks,
+        context_used,
+    )
 
 
 def _build_retrieval_trace_response(
     query: str,
     top_k: int,
 ) -> StructuredResponse:
-    """Return the normal RAG answer plus retrieval evidence."""
 
-    answer, retrieved_chunks, context_used = _run_rag_response(
-        query,
-        top_k,
+    answer, retrieved_chunks, context_used = (
+        _run_rag_response(
+            query,
+            top_k,
+        )
     )
 
     evidence = (
         retrieved_chunks
-        if isinstance(retrieved_chunks, list)
+        if isinstance(
+            retrieved_chunks,
+            list,
+        )
         else []
     )
 
@@ -1007,16 +1139,20 @@ def _build_standard_answer_response(
     query: str,
     top_k: int,
 ) -> StructuredResponse:
-    """Preserve the existing RAG answer behavior."""
 
-    answer, retrieved_chunks, context_used = _run_rag_response(
-        query,
-        top_k,
+    answer, retrieved_chunks, context_used = (
+        _run_rag_response(
+            query,
+            top_k,
+        )
     )
 
     evidence = (
         retrieved_chunks
-        if isinstance(retrieved_chunks, list)
+        if isinstance(
+            retrieved_chunks,
+            list,
+        )
         else []
     )
 
@@ -1037,19 +1173,20 @@ def _build_git_history_response(
     target: Optional[str],
     top_k: int,
 ) -> StructuredResponse:
-    """
-    Preserve the existing Git/RAG reasoning behavior while exposing
-    the response through the structured response contract.
-    """
 
-    answer, retrieved_chunks, context_used = _run_rag_response(
-        query,
-        top_k,
+    answer, retrieved_chunks, context_used = (
+        _run_rag_response(
+            query,
+            top_k,
+        )
     )
 
     evidence = (
         retrieved_chunks
-        if isinstance(retrieved_chunks, list)
+        if isinstance(
+            retrieved_chunks,
+            list,
+        )
         else []
     )
 
@@ -1071,18 +1208,11 @@ def _build_flow_response(
     target: Optional[str],
     top_k: int,
 ) -> StructuredResponse:
-    """
-    Build a flow response from actual graph relationships.
-
-    For a generic flow question with no explicit target, the existing
-    RAG engine is used to preserve semantic/business-flow reasoning.
-    For a targeted flow question, direct graph caller/callee edges are
-    exposed as structured steps and edges.
-    """
 
     graph = state.graph_db
 
     if not graph:
+
         return StructuredResponse(
             query=query,
             response_type=QueryIntent.FLOW.value,
@@ -1096,14 +1226,20 @@ def _build_flow_response(
     # ---------------------------------------------------------
 
     if not target:
-        answer, retrieved_chunks, context_used = _run_rag_response(
-            query,
-            top_k,
+
+        answer, retrieved_chunks, context_used = (
+            _run_rag_response(
+                query,
+                top_k,
+            )
         )
 
         evidence = (
             retrieved_chunks
-            if isinstance(retrieved_chunks, list)
+            if isinstance(
+                retrieved_chunks,
+                list,
+            )
             else []
         )
 
@@ -1147,7 +1283,11 @@ def _build_flow_response(
     )
 
     for caller in callers:
-        caller_name = _safe_name(caller)
+
+        caller_name = _safe_name(
+            caller
+        )
+
         if not caller_name:
             continue
 
@@ -1168,7 +1308,11 @@ def _build_flow_response(
         )
 
     for callee in callees:
-        callee_name = _safe_name(callee)
+
+        callee_name = _safe_name(
+            callee
+        )
+
         if not callee_name:
             continue
 
@@ -1189,13 +1333,17 @@ def _build_flow_response(
         )
 
     unique_steps = {}
+
     for step in steps:
-        unique_steps[step["id"]] = step
+        unique_steps[
+            step["id"]
+        ] = step
 
     unique_edges = []
     seen_edges = set()
 
     for edge in edges:
+
         edge_key = (
             edge["source"],
             edge["target"],
@@ -1205,8 +1353,13 @@ def _build_flow_response(
         if edge_key in seen_edges:
             continue
 
-        seen_edges.add(edge_key)
-        unique_edges.append(edge)
+        seen_edges.add(
+            edge_key
+        )
+
+        unique_edges.append(
+            edge
+        )
 
     answer = (
         f"The flow around {target} contains "
@@ -1220,7 +1373,9 @@ def _build_flow_response(
         answer=answer,
         data={
             "target": target,
-            "steps": list(unique_steps.values()),
+            "steps": list(
+                unique_steps.values()
+            ),
             "edges": unique_edges,
             "mode": "graph",
         },
@@ -1228,8 +1383,18 @@ def _build_flow_response(
     )
 
 
-@app.post("/api/query", response_model=StructuredResponse)
-@app.post("/ask", response_model=StructuredResponse)
+# =========================================================
+# QUERY ENDPOINT
+# =========================================================
+
+@app.post(
+    "/api/query",
+    response_model=StructuredResponse,
+)
+@app.post(
+    "/ask",
+    response_model=StructuredResponse,
+)
 def query_codebase(
     payload: QueryRequest,
 ):
@@ -1255,7 +1420,9 @@ def query_codebase(
         # 1. Route the query by intent
         # -----------------------------------------------------
 
-        route = state.query_router.route(q_text)
+        route = state.query_router.route(
+            q_text
+        )
 
         print(
             f"[Query Router] intent={route.intent.value} "
@@ -1269,11 +1436,14 @@ def query_codebase(
         if route.intent == QueryIntent.CALL_GRAPH:
 
             if route.target:
+
                 result = _build_call_graph_response(
                     q_text,
                     route.target,
                 )
+
             else:
+
                 result = _build_standard_answer_response(
                     q_text,
                     payload.top_k,
@@ -1282,11 +1452,14 @@ def query_codebase(
         elif route.intent == QueryIntent.IMPACT:
 
             if route.target:
+
                 result = _build_impact_response(
                     q_text,
                     route.target,
                 )
+
             else:
+
                 result = _build_standard_answer_response(
                     q_text,
                     payload.top_k,
@@ -1323,7 +1496,7 @@ def query_codebase(
             )
 
         # -----------------------------------------------------
-        # 3. Return the Pydantic structured response
+        # 3. Return response
         # -----------------------------------------------------
 
         return result
@@ -1375,19 +1548,11 @@ def get_entity_dependencies(
 
         graph = state.graph_db
 
-        # -------------------------------------------------
-        # Callers
-        # -------------------------------------------------
-
         callers = _call_graph_method(
             graph,
             "get_callers_of",
             entity_name,
         )
-
-        # -------------------------------------------------
-        # Callees
-        # -------------------------------------------------
 
         callees = _call_graph_method(
             graph,
@@ -1611,3 +1776,4 @@ if __name__ == "__main__":
         port=8000,
         reload=True,
     )
+
