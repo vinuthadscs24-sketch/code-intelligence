@@ -59,7 +59,6 @@ class HybridRetriever:
         self.vector_weight = vector_weight
         self.graph_weight = graph_weight
 
-        # Prevent accidental invalid configurations.
         if self.rrf_k <= 0:
             raise ValueError("rrf_k must be greater than 0.")
 
@@ -71,7 +70,8 @@ class HybridRetriever:
 
         if self.vector_weight == 0 and self.graph_weight == 0:
             raise ValueError(
-                "At least one of vector_weight or graph_weight must be greater than 0."
+                "At least one of vector_weight or graph_weight "
+                "must be greater than 0."
             )
 
     # ------------------------------------------------------------------
@@ -179,8 +179,6 @@ class HybridRetriever:
             if len(token) > 2
         ]
 
-        # Remove common natural-language words that don't help
-        # identify code entities.
         stop_words = {
             "the",
             "and",
@@ -222,15 +220,6 @@ class HybridRetriever:
     ) -> List[Dict[str, Any]]:
         """
         Performs graph retrieval independently of vector retrieval.
-
-        Current V1 strategy:
-            Query tokens
-                ↓
-            Match graph node names
-                ↓
-            Retrieve graph relationships
-
-        This intentionally does NOT depend on FAISS results.
         """
 
         if not hasattr(self.kg, "graph") or self.kg.graph is None:
@@ -247,7 +236,6 @@ class HybridRetriever:
             node_string = str(node)
             node_lower = node_string.lower()
 
-            # Calculate a simple lexical match score.
             matched_tokens = [
                 token
                 for token in tokens
@@ -257,7 +245,6 @@ class HybridRetriever:
             if not matched_tokens:
                 continue
 
-            # More matched query tokens = stronger graph candidate.
             match_score = len(matched_tokens) / len(tokens)
 
             callers = []
@@ -316,14 +303,14 @@ class HybridRetriever:
                     "graph_callers": callers,
                     "graph_callees": callees,
                     "code_content": code_content,
-
-                    # Useful for debugging/evaluation.
-                    "graph_match_score": round(match_score, 6),
+                    "graph_match_score": round(
+                        match_score,
+                        6,
+                    ),
                     "graph_matched_tokens": matched_tokens,
                 }
             )
 
-        # Stronger lexical graph matches first.
         candidates.sort(
             key=lambda item: (
                 item.get("graph_match_score", 0),
@@ -383,12 +370,6 @@ class HybridRetriever:
         if top_k <= 0:
             return []
 
-        # Retrieve extra candidates because:
-        #
-        #   1. Some results may be duplicates.
-        #   2. File diversity may remove results.
-        #   3. Graph and vector retrieval may overlap.
-        #
         fetch_limit = max(top_k * 4, 10)
 
         # ==============================================================
@@ -404,7 +385,10 @@ class HybridRetriever:
 
         for result in raw_vector_results:
             if isinstance(result, tuple):
-                if len(result) > 0 and isinstance(result[0], dict):
+                if (
+                    len(result) > 0
+                    and isinstance(result[0], dict)
+                ):
                     vector_chunks.append(result[0])
 
             elif isinstance(result, dict):
@@ -460,7 +444,6 @@ class HybridRetriever:
 
             if chunk_id not in doc_map:
 
-                # Copy so we never mutate the original result.
                 doc_map[chunk_id] = dict(chunk)
 
                 doc_map[chunk_id]["sources"] = []
@@ -499,7 +482,6 @@ class HybridRetriever:
             ):
 
                 if graph_key in chunk and chunk[graph_key]:
-
                     document[graph_key] = chunk[graph_key]
 
             # ----------------------------------------------------------
@@ -634,10 +616,6 @@ class HybridRetriever:
                 [],
             )
 
-            # ----------------------------------------------------------
-            # Prefer diverse files
-            # ----------------------------------------------------------
-
             if current_count < self.max_per_file:
 
                 file_counts[file_key] = (
@@ -682,5 +660,79 @@ class HybridRetriever:
             start=1,
         ):
             result["final_rank"] = index
+
+        # ==============================================================
+        # 10. DEBUG RETRIEVAL
+        # ==============================================================
+
+        print("\n========== RETRIEVAL DEBUG ==========")
+        print("QUERY:", query)
+
+        print("\n--- QUERY TOKENS ---")
+        print(self._get_graph_tokens(query))
+
+        print("\n--- VECTOR RESULTS ---")
+
+        for i, chunk in enumerate(
+            vector_chunks[:15],
+            start=1,
+        ):
+            print(
+                i,
+                "|",
+                chunk.get("chunk_id"),
+                "| class=",
+                chunk.get("class_name"),
+                "| method=",
+                chunk.get("method_name"),
+                "| score=",
+                chunk.get("score"),
+            )
+
+        print("\n--- GRAPH RESULTS ---")
+
+        for i, chunk in enumerate(
+            graph_chunks[:15],
+            start=1,
+        ):
+            print(
+                i,
+                "|",
+                chunk.get("chunk_id"),
+                "| class=",
+                chunk.get("class_name"),
+                "| method=",
+                chunk.get("method_name"),
+                "| match_score=",
+                chunk.get("graph_match_score"),
+                "| matched_tokens=",
+                chunk.get("graph_matched_tokens"),
+            )
+
+        print("\n--- FINAL RESULTS ---")
+
+        for i, chunk in enumerate(
+            final_results,
+            start=1,
+        ):
+            print(
+                i,
+                "|",
+                chunk.get("chunk_id"),
+                "| class=",
+                chunk.get("class_name"),
+                "| method=",
+                chunk.get("method_name"),
+                "| combined_score=",
+                chunk.get("combined_score"),
+                "| sources=",
+                chunk.get("sources"),
+                "| vector_rank=",
+                chunk.get("vector_rank"),
+                "| graph_rank=",
+                chunk.get("graph_rank"),
+            )
+
+        print("====================================\n")
 
         return final_results

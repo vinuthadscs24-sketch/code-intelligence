@@ -35,12 +35,6 @@ class VectorStore:
         self.dimension = dimension
         self.index_dir = index_dir
 
-        # IMPORTANT:
-        # Keep the final embedding text safely below the
-        # Ollama model context length.
-        #
-        # This is a CHARACTER limit, not a token limit.
-        # 1200 chars is intentionally conservative.
         self.max_embedding_chars = 1200
 
         self.embedding_url = (
@@ -139,24 +133,7 @@ class VectorStore:
     ) -> str:
         """
         Build a compact semantic representation of a code chunk.
-
-        The returned text is ALWAYS capped at
-        self.max_embedding_chars.
-
-        Important design decisions:
-
-        1. Structural metadata is preserved.
-        2. Calls are represented compactly.
-        3. Complete call dictionaries are NOT dumped into the
-           embedding text.
-        4. Code is truncated first.
-        5. Metadata is progressively shortened if necessary.
-        6. A final hard safety limit is always applied.
         """
-
-        # --------------------------------------------------------
-        # BASIC METADATA
-        # --------------------------------------------------------
 
         chunk_type = self._safe_string(
             chunk.get(
@@ -260,6 +237,7 @@ class VectorStore:
                         ).strip()
 
                         if target_method:
+
                             call_names.append(
                                 target_method
                             )
@@ -271,6 +249,7 @@ class VectorStore:
                     ).strip()
 
                     if value:
+
                         call_names.append(
                             value
                         )
@@ -282,11 +261,11 @@ class VectorStore:
             )
 
             if calls_string:
+
                 call_names.append(
                     calls_string
                 )
 
-        # Remove duplicates while preserving order.
         call_names = list(
             dict.fromkeys(
                 call_names
@@ -482,8 +461,6 @@ class VectorStore:
     ) -> List[float]:
         """
         Generate one embedding using Ollama.
-
-        The text is hard-capped before being sent to Ollama.
         """
 
         if not isinstance(
@@ -493,7 +470,6 @@ class VectorStore:
 
             text = str(text)
 
-        # Absolute safety guard.
         text = text[
             : self.max_embedding_chars
         ]
@@ -527,6 +503,7 @@ class VectorStore:
                 if not response.ok:
 
                     try:
+
                         error_data = (
                             response.json()
                         )
@@ -632,6 +609,15 @@ class VectorStore:
             start=1,
         ):
 
+            # DEBUG:
+            # Show exactly which chunk is being embedded.
+            logger.info(
+                "Embedding chunk %s/%s | chars=%s",
+                index,
+                total,
+                len(text),
+            )
+
             try:
 
                 embedding = (
@@ -675,7 +661,6 @@ class VectorStore:
             dtype=np.float32,
         )
 
-        # Safety check.
         if matrix.ndim != 2:
 
             raise RuntimeError(
@@ -715,10 +700,6 @@ class VectorStore:
             len(chunks),
         )
 
-        # --------------------------------------------------------
-        # Build embedding texts
-        # --------------------------------------------------------
-
         texts = []
 
         valid_chunks = []
@@ -743,7 +724,6 @@ class VectorStore:
 
                 continue
 
-            # Absolute final safety check.
             text = text[
                 : self.max_embedding_chars
             ]
@@ -762,17 +742,9 @@ class VectorStore:
                 "No valid text available for embedding."
             )
 
-        # --------------------------------------------------------
-        # Generate embeddings
-        # --------------------------------------------------------
-
         embeddings = self._embed(
             texts
         )
-
-        # --------------------------------------------------------
-        # Verify metadata/vector alignment
-        # --------------------------------------------------------
 
         if len(embeddings) != len(
             valid_chunks
@@ -785,19 +757,9 @@ class VectorStore:
                 f"metadata={len(valid_chunks)}"
             )
 
-        # --------------------------------------------------------
-        # Normalize embeddings
-        #
-        # IndexFlatIP + normalized vectors gives cosine similarity.
-        # --------------------------------------------------------
-
         faiss.normalize_L2(
             embeddings
         )
-
-        # --------------------------------------------------------
-        # Create FAISS index
-        # --------------------------------------------------------
 
         self.index = faiss.IndexFlatIP(
             self.dimension
@@ -807,8 +769,6 @@ class VectorStore:
             embeddings
         )
 
-        # IMPORTANT:
-        # Store exactly the chunks corresponding to vectors.
         self.chunks = valid_chunks
 
         logger.info(

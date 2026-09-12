@@ -13,7 +13,41 @@ export async function askCodebase(query) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(errorText || `Request failed: ${response.status}`);
+    throw new Error(
+      errorText || `Request failed: ${response.status}`
+    );
+  }
+
+  return response.json();
+}
+
+export async function getDependencies(entityName) {
+  const response = await fetch(
+    `${API_BASE_URL}/dependencies/${encodeURIComponent(entityName)}`
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      errorText || `Request failed: ${response.status}`
+    );
+  }
+
+  return response.json();
+}
+
+export async function getImpact(entityName, maxDepth = 3) {
+  const response = await fetch(
+    `${API_BASE_URL}/impact/${encodeURIComponent(
+      entityName
+    )}?max_depth=${maxDepth}`
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      errorText || `Request failed: ${response.status}`
+    );
   }
 
   return response.json();

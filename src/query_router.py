@@ -37,6 +37,13 @@ class QueryRouter:
 
     CALLEE_PATTERNS = [
         r"\bwhat\s+does\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+call\b",
+
+        # FIX:
+        # Supports:
+        # "What functions does test_insert call?"
+        # "What methods does test_insert call?"
+        r"\bwhat\s+(?:methods?|functions?)\s+does\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+call\b",
+
         r"\bwhich\s+(?:methods?|functions?)\s+does\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+call\b",
         r"\bcallees?\s+of\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
         r"\bwhat\s+(?:methods?|functions?)\s+(?:are|does)\s+called\s+by\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
@@ -132,6 +139,9 @@ class QueryRouter:
 
         # Most specific structural queries first.
 
+        # -----------------------------
+        # Caller queries
+        # -----------------------------
         target = cls._extract_target(
             query,
             cls.CALLER_PATTERNS,
@@ -143,6 +153,9 @@ class QueryRouter:
                 target,
             )
 
+        # -----------------------------
+        # Callee queries
+        # -----------------------------
         target = cls._extract_target(
             query,
             cls.CALLEE_PATTERNS,
@@ -154,29 +167,44 @@ class QueryRouter:
                 target,
             )
 
+        # -----------------------------
+        # Impact queries
+        # -----------------------------
         if cls._matches_any(query, cls.IMPACT_PATTERNS):
             return QueryRoute(
                 QueryIntent.IMPACT,
                 cls._extract_entity_target(query),
             )
 
+        # -----------------------------
+        # Git history queries
+        # -----------------------------
         if cls._matches_any(query, cls.GIT_PATTERNS):
             return QueryRoute(
                 QueryIntent.GIT_HISTORY,
                 cls._extract_entity_target(query),
             )
 
+        # -----------------------------
+        # Retrieval trace queries
+        # -----------------------------
         if cls._matches_any(query, cls.RETRIEVAL_PATTERNS):
             return QueryRoute(
                 QueryIntent.RETRIEVAL_TRACE,
             )
 
+        # -----------------------------
+        # Flow queries
+        # -----------------------------
         if cls._matches_any(query, cls.FLOW_PATTERNS):
             return QueryRoute(
                 QueryIntent.FLOW,
                 cls._extract_flow_target(query),
             )
 
+        # -----------------------------
+        # Normal RAG answer
+        # -----------------------------
         return QueryRoute(QueryIntent.ANSWER)
 
     @classmethod
