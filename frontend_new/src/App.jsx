@@ -1,14 +1,11 @@
+
 import { useState } from "react";
 import "./App.css";
 import { askCodebase } from "./api";
 import CallGraph from "./components/CallGraph";
-import CodeExplorer from "./components/CodeExplorer";
 
 const navigation = [
   { id: "ask", label: "Ask Codebase", icon: "⌕" },
-  { id: "explorer", label: "Code Explorer", icon: "◇" },
-  { id: "impact", label: "Impact Analysis", icon: "◎" },
-  { id: "git", label: "Git History", icon: "↻" },
 ];
 
 function App() {
@@ -100,65 +97,192 @@ function App() {
         </div>
 
         <div className="retrieved-list">
-          {chunks.map((chunk, index) => (
-            <div
-              className="code-card"
-              key={chunk.chunk_id || index}
-            >
-              <div className="code-card-header">
-                <div>
-                  <div className="code-symbol">
-                    {getSymbolName(chunk)}
+          {chunks.map((chunk, index) => {
+            const isFileChunk = chunk.chunk_type === "FILE";
+
+            return (
+              <div
+                className={`code-card ${
+                  isFileChunk ? "file-code-card" : ""
+                }`}
+                key={chunk.chunk_id || index}
+              >
+                <div className="code-card-header">
+                  <div>
+                    <div className="code-symbol">
+                      {getSymbolName(chunk)}
+                    </div>
+
+                    <div className="code-location">
+                      {getFileName(
+                        chunk.file_name ||
+                          chunk.file ||
+                          chunk.file_path
+                      )}
+                      {" · "}
+                      lines {chunk.start_line || "?"}–
+                      {chunk.end_line || "?"}
+                    </div>
                   </div>
 
-                  <div className="code-location">
-                    {getFileName(
-                      chunk.file_name ||
-                        chunk.file ||
-                        chunk.file_path
-                    )}
-                    {" · "}
-                    lines {chunk.start_line || "?"}–
-                    {chunk.end_line || "?"}
-                  </div>
+                  <span className="code-rank">
+                    #{chunk.final_rank || index + 1}
+                  </span>
                 </div>
 
-                <span className="code-rank">
-                  #{chunk.final_rank || index + 1}
-                </span>
+                <pre className="code-preview">
+                  {chunk.code_content ||
+                    chunk.source_code ||
+                    "No source code available."}
+                </pre>
+
+                <div className="code-card-footer">
+                  <span>
+                    {isFileChunk
+                      ? "FILE"
+                      : chunk.chunk_type || "CODE"}
+                  </span>
+
+                  <span>
+                    {chunk.sources?.includes("vector") &&
+                    isFileChunk
+                      ? "FILEvector"
+                      : chunk.sources?.join(" + ") ||
+                        "retrieval"}
+                  </span>
+                </div>
               </div>
-
-              <pre className="code-preview">
-                {chunk.code_content ||
-                  chunk.source_code ||
-                  "No source code available."}
-              </pre>
-
-              <div className="code-card-footer">
-                <span>
-                  {chunk.chunk_type || "CODE"}
-                </span>
-
-                <span>
-                  {chunk.sources?.join(" + ") ||
-                    "retrieval"}
-                </span>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     );
   }
 
+  function renderDynamicResult() {
+    if (!result) {
+      return null;
+    }
+
+    /*
+      CALL GRAPH
+    */
+    if (
+      result.response_type === "call_graph" &&
+      result.data
+    ) {
+      return (
+        <>
+          <div className="result-answer">
+            {result.answer ||
+              "Call graph analysis completed."}
+          </div>
+
+          <CallGraph data={result.data} />
+        </>
+      );
+    }
+
+    /*
+      NORMAL CODE RETRIEVAL / ANSWER
+
+      Show the answer first.
+      Then show the retrieved code that supports it.
+    */
+    if (result.response_type === "answer") {
+      return (
+        <>
+          {result.answer && (
+            <div className="result-answer">
+              {result.answer}
+            </div>
+          )}
+
+          {renderRetrievedCode()}
+        </>
+      );
+    }
+
+    /*
+      IMPACT ANALYSIS
+    */
+    if (result.response_type === "impact") {
+      return (
+        <div className="dynamic-analysis">
+          <div className="dynamic-analysis-label">
+            IMPACT ANALYSIS
+          </div>
+
+          <div className="result-answer">
+            {result.answer ||
+              "Impact analysis completed."}
+          </div>
+
+          <div className="dynamic-analysis-placeholder">
+            Impact visualization will appear here.
+          </div>
+        </div>
+      );
+    }
+
+    /*
+      GIT HISTORY
+    */
+    if (
+      result.response_type === "git_history" ||
+      result.response_type === "git"
+    ) {
+      return (
+        <div className="dynamic-analysis">
+          <div className="dynamic-analysis-label">
+            GIT HISTORY
+          </div>
+
+          <div className="result-answer">
+            {result.answer ||
+              "Git history analysis completed."}
+          </div>
+
+          <div className="dynamic-analysis-placeholder">
+            Git history visualization will appear here.
+          </div>
+        </div>
+      );
+    }
+
+    /*
+      GENERIC FALLBACK
+    */
+    return (
+      <>
+        {result.answer && (
+          <div className="result-answer">
+            {result.answer}
+          </div>
+        )}
+
+        {renderRetrievedCode()}
+      </>
+    );
+  }
+
   return (
     <div className="app-shell">
-      {/* TOP BAR */}
+
+      {/* =====================================================
+          TOP BAR
+      ===================================================== */}
+
       <header className="topbar">
+
         <div className="brand">
-          <div className="brand-mark">&lt;/&gt;</div>
+
+          <div className="brand-mark">
+            &lt;/&gt;
+          </div>
 
           <div>
+
             <div className="brand-name">
               CODE INTELLIGENCE
             </div>
@@ -166,11 +290,15 @@ function App() {
             <div className="brand-subtitle">
               AI-powered codebase analysis
             </div>
+
           </div>
+
         </div>
 
         <div className="repo-status">
+
           <div className="repo-info">
+
             <span className="status-dot"></span>
 
             <span className="repo-name">
@@ -180,15 +308,23 @@ function App() {
             <span className="branch">
               fix/code-indexing
             </span>
+
           </div>
 
           <div className="index-status">
-            <span className="index-icon">◈</span>
+
+            <span className="index-icon">
+              ◈
+            </span>
+
             INDEXED
+
           </div>
+
         </div>
 
         <div className="top-actions">
+
           <button
             className="icon-button"
             title="Search"
@@ -203,16 +339,28 @@ function App() {
             ⚙
           </button>
 
-          <div className="avatar">V</div>
+          <div className="avatar">
+            V
+          </div>
+
         </div>
+
       </header>
 
-      {/* MAIN LAYOUT */}
+      {/* =====================================================
+          MAIN LAYOUT
+      ===================================================== */}
+
       <div className="main-layout">
 
-        {/* SIDEBAR */}
+        {/* ===================================================
+            SIDEBAR
+        =================================================== */}
+
         <aside className="sidebar">
+
           <div className="sidebar-section">
+
             <div className="section-label">
               INTELLIGENCE
             </div>
@@ -229,18 +377,28 @@ function App() {
                   setActiveView(item.id)
                 }
               >
+
                 <span className="nav-icon">
                   {item.icon}
                 </span>
 
-                <span>{item.label}</span>
+                <span>
+                  {item.label}
+                </span>
+
               </button>
             ))}
+
           </div>
 
           <div className="sidebar-divider"></div>
 
+          {/* =================================================
+              REPOSITORY
+          ================================================= */}
+
           <div className="sidebar-section">
+
             <div className="section-label">
               REPOSITORY
             </div>
@@ -269,13 +427,21 @@ function App() {
               <span>›</span>
               <span>services</span>
             </div>
+
           </div>
 
+          {/* =================================================
+              SIDEBAR STATUS
+          ================================================= */}
+
           <div className="sidebar-bottom">
+
             <div className="pipeline-status">
+
               <span className="status-dot"></span>
 
               <div>
+
                 <div className="pipeline-title">
                   Analysis ready
                 </div>
@@ -283,21 +449,32 @@ function App() {
                 <div className="pipeline-meta">
                   2,481 symbols indexed
                 </div>
+
               </div>
+
             </div>
+
           </div>
+
         </aside>
 
-        {/* WORKSPACE */}
+        {/* ===================================================
+            WORKSPACE
+        =================================================== */}
+
         <main className="workspace">
 
+          {/* =================================================
+              WORKSPACE HEADER
+          ================================================= */}
+
           <div className="workspace-header">
+
             <div>
+
               <div className="breadcrumb">
                 WORKSPACE <span>/</span>{" "}
-                {activeView
-                  .toUpperCase()
-                  .replace("-", " ")}
+                ASK CODEBASE
               </div>
 
               <h1>
@@ -309,295 +486,293 @@ function App() {
                 Code Intelligence maps relationships,
                 history, and impact automatically.
               </p>
+
             </div>
+
           </div>
 
-          {/* ASK CODEBASE QUERY */}
-          {activeView === "ask" && (
-            <section className="query-section">
-              <div className="query-label">
-                <span className="query-command">
-                  ⌘
+          {/* =================================================
+              QUERY SECTION
+          ================================================= */}
+
+          <section className="query-section">
+
+            <div className="query-label">
+
+              <span className="query-command">
+                ⌘
+              </span>
+
+              ASK YOUR CODEBASE
+
+            </div>
+
+            <div className="query-box">
+
+              <span className="query-prefix">
+                &gt;
+              </span>
+
+              <input
+                value={query}
+                onChange={(event) =>
+                  setQuery(event.target.value)
+                }
+                onKeyDown={handleKeyDown}
+                placeholder="Who calls createBooking?"
+                aria-label="Ask your codebase"
+              />
+
+              <button
+                className="ask-button"
+                onClick={handleAsk}
+                disabled={loading}
+              >
+
+                {loading
+                  ? "ANALYZING"
+                  : "ASK"}
+
+                <span>
+                  {loading ? "..." : "↵"}
                 </span>
 
-                ASK YOUR CODEBASE
-              </div>
+              </button>
 
-              <div className="query-box">
-                <span className="query-prefix">
-                  &gt;
-                </span>
+            </div>
 
-                <input
-                  value={query}
-                  onChange={(event) =>
-                    setQuery(event.target.value)
-                  }
-                  onKeyDown={handleKeyDown}
-                  placeholder="Who calls createBooking?"
-                  aria-label="Ask your codebase"
-                />
+            {/* =================================================
+                EXAMPLE QUESTIONS
+            ================================================= */}
 
-                <button
-                  className="ask-button"
-                  onClick={handleAsk}
-                  disabled={loading}
-                >
-                  {loading
-                    ? "ANALYZING"
-                    : "ASK"}
+            <div className="query-hints">
+
+              <button
+                onClick={() =>
+                  useExample(
+                    "Who calls createBooking?"
+                  )
+                }
+              >
+                Who calls createBooking?
+              </button>
+
+              <button
+                onClick={() =>
+                  useExample(
+                    "What breaks if I change UserService?"
+                  )
+                }
+              >
+                What breaks if I change UserService?
+              </button>
+
+              <button
+                onClick={() =>
+                  useExample(
+                    "Show recent booking changes"
+                  )
+                }
+              >
+                Show recent booking changes
+              </button>
+
+            </div>
+
+          </section>
+
+          {/* =================================================
+              ANALYSIS WORKSPACE
+          ================================================= */}
+
+          <section className="analysis-workspace">
+
+            <div className="workspace-grid"></div>
+
+            {/* =================================================
+                LOADING
+            ================================================= */}
+
+            {loading && (
+              <div className="analysis-state">
+
+                <div className="loading-indicator"></div>
+
+                <div className="state-title">
+                  Analyzing your codebase
+                </div>
+
+                <div className="pipeline-steps">
 
                   <span>
-                    {loading ? "..." : "↵"}
+                    QUERY CLASSIFIED
                   </span>
-                </button>
+
+                  <span>
+                    SYMBOLS RETRIEVED
+                  </span>
+
+                  <span>
+                    DEPENDENCIES ANALYZED
+                  </span>
+
+                  <span>
+                    GENERATING RESPONSE
+                  </span>
+
+                </div>
+
               </div>
+            )}
 
-              <div className="query-hints">
-                <button
-                  onClick={() =>
-                    useExample(
-                      "Who calls createBooking?"
-                    )
-                  }
-                >
-                  Who calls createBooking?
-                </button>
+            {/* =================================================
+                ERROR
+            ================================================= */}
 
-                <button
-                  onClick={() =>
-                    useExample(
-                      "What breaks if I change UserService?"
-                    )
-                  }
-                >
-                  What breaks if I change UserService?
-                </button>
+            {!loading && error && (
+              <div className="analysis-state error-state">
 
-                <button
-                  onClick={() =>
-                    useExample(
-                      "Show recent booking changes"
-                    )
-                  }
-                >
-                  Show recent booking changes
-                </button>
+                <div className="state-icon">
+                  !
+                </div>
+
+                <div className="state-title">
+                  Backend connection failed
+                </div>
+
+                <div className="state-description">
+                  {error}
+                </div>
+
               </div>
-            </section>
-          )}
+            )}
 
-          {/* ANALYSIS WORKSPACE */}
-          {activeView === "ask" && (
-            <section className="analysis-workspace">
-              <div className="workspace-grid"></div>
+            {/* =================================================
+                EMPTY STATE
+            ================================================= */}
 
-              {/* LOADING */}
-              {loading && (
-                <div className="analysis-state">
-                  <div className="loading-indicator"></div>
+            {!loading &&
+              !error &&
+              !result && (
+                <div className="empty-analysis">
 
-                  <div className="state-title">
-                    Analyzing your codebase
+                  <div className="analysis-symbol">
+
+                    <div className="node node-a"></div>
+                    <div className="node node-b"></div>
+                    <div className="node node-c"></div>
+
+                    <div className="connection connection-a"></div>
+                    <div className="connection connection-b"></div>
+
                   </div>
 
-                  <div className="pipeline-steps">
-                    <span>
-                      QUERY CLASSIFIED
-                    </span>
-
-                    <span>
-                      SYMBOLS RETRIEVED
-                    </span>
-
-                    <span>
-                      DEPENDENCIES ANALYZED
-                    </span>
-
-                    <span>
-                      GENERATING RESPONSE
-                    </span>
+                  <div className="empty-title">
+                    Your code intelligence workspace
                   </div>
+
+                  <div className="empty-description">
+                    Ask a question above to generate
+                    an adaptive analysis.
+                    <br />
+                    The visualization changes based
+                    on what you ask.
+                  </div>
+
+                  <div className="analysis-types">
+
+                    <span>
+                      CALL GRAPH
+                    </span>
+
+                    <span>
+                      IMPACT
+                    </span>
+
+                    <span>
+                      GIT HISTORY
+                    </span>
+
+                    <span>
+                      RETRIEVAL
+                    </span>
+
+                  </div>
+
                 </div>
               )}
 
-              {/* ERROR */}
-              {!loading && error && (
-                <div className="analysis-state error-state">
-                  <div className="state-icon">
-                    !
+            {/* =================================================
+                RESULT
+            ================================================= */}
+
+            {!loading &&
+              !error &&
+              result && (
+                <div className="result-panel">
+
+                  <div className="result-header">
+
+                    <div>
+
+                      <div className="result-type">
+                        {result.response_type ||
+                          "ANALYSIS"}
+                      </div>
+
+                      <div className="result-query">
+                        {result.query || query}
+                      </div>
+
+                    </div>
+
+                    <div className="result-badge">
+                      LIVE RESPONSE
+                    </div>
+
                   </div>
 
-                  <div className="state-title">
-                    Backend connection failed
-                  </div>
+                  {/* =================================================
+                      DYNAMIC RESULT
+                  ================================================= */}
 
-                  <div className="state-description">
-                    {error}
-                  </div>
+                  {renderDynamicResult()}
+
+                  {/* =================================================
+                      RAW RESPONSE
+                  ================================================= */}
+
+                  {result.data && (
+                    <div className="result-data">
+
+                      <details>
+
+                        <summary>
+                          Raw response
+                        </summary>
+
+                        <pre>
+                          {JSON.stringify(
+                            result.data,
+                            null,
+                            2
+                          )}
+                        </pre>
+
+                      </details>
+
+                    </div>
+                  )}
+
                 </div>
               )}
 
-              {/* EMPTY */}
-              {!loading &&
-                !error &&
-                !result && (
-                  <div className="empty-analysis">
-                    <div className="analysis-symbol">
-                      <div className="node node-a"></div>
-                      <div className="node node-b"></div>
-                      <div className="node node-c"></div>
-
-                      <div className="connection connection-a"></div>
-                      <div className="connection connection-b"></div>
-                    </div>
-
-                    <div className="empty-title">
-                      Your code intelligence workspace
-                    </div>
-
-                    <div className="empty-description">
-                      Ask a question above to generate
-                      an adaptive analysis.
-                      <br />
-                      The visualization changes based
-                      on what you ask.
-                    </div>
-
-                    <div className="analysis-types">
-                      <span>CALL GRAPH</span>
-                      <span>IMPACT</span>
-                      <span>GIT HISTORY</span>
-                      <span>RETRIEVAL</span>
-                    </div>
-                  </div>
-                )}
-
-              {/* RESULT */}
-              {!loading &&
-                !error &&
-                result && (
-                  <div className="result-panel">
-
-                    <div className="result-header">
-                      <div>
-                        <div className="result-type">
-                          {result.response_type ||
-                            "ANALYSIS"}
-                        </div>
-
-                        <div className="result-query">
-                          {result.query || query}
-                        </div>
-                      </div>
-
-                      <div className="result-badge">
-                        LIVE RESPONSE
-                      </div>
-                    </div>
-
-                    {/* CALL GRAPH */}
-                    {result.response_type ===
-                      "call_graph" &&
-                    result.data ? (
-                      <>
-                        <div className="result-answer">
-                          {result.answer ||
-                            "Call graph analysis completed."}
-                        </div>
-
-                        <CallGraph
-                          data={result.data}
-                        />
-                      </>
-                    ) : (
-                      <>
-                        {result.response_type ===
-                        "answer" ? (
-                          <div className="retrieval-summary">
-                            Retrieved relevant code
-                            from the indexed codebase.
-                          </div>
-                        ) : (
-                          result.answer && (
-                            <div className="result-answer">
-                              {result.answer}
-                            </div>
-                          )
-                        )}
-
-                        {renderRetrievedCode()}
-
-                        {result.data && (
-                          <div className="result-data">
-                            <details>
-                              <summary>
-                                Raw response
-                              </summary>
-
-                              <pre>
-                                {JSON.stringify(
-                                  result.data,
-                                  null,
-                                  2
-                                )}
-                              </pre>
-                            </details>
-                          </div>
-                        )}
-                      </>
-                    )}
-                  </div>
-                )}
-            </section>
-          )}
-
-          {/* CODE EXPLORER */}
-          {activeView === "explorer" && (
-            <CodeExplorer result={result} />
-          )}
-
-          {/* TEMPORARY IMPACT VIEW */}
-          {activeView === "impact" && (
-            <div className="explorer-empty">
-              <div className="explorer-empty-icon">
-                ◎
-              </div>
-
-              <div className="explorer-empty-title">
-                Impact Analysis
-              </div>
-
-              <div className="explorer-empty-text">
-                This section will use the real{" "}
-                <strong>
-                  /impact/{`{entity_name}`}
-                </strong>{" "}
-                backend endpoint.
-              </div>
-            </div>
-          )}
-
-          {/* TEMPORARY GIT VIEW */}
-          {activeView === "git" && (
-            <div className="explorer-empty">
-              <div className="explorer-empty-icon">
-                ↻
-              </div>
-
-              <div className="explorer-empty-title">
-                Git History
-              </div>
-
-              <div className="explorer-empty-text">
-                This section will use the real Git
-                provenance backend endpoint.
-              </div>
-            </div>
-          )}
+          </section>
 
         </main>
+
       </div>
+
     </div>
   );
 }

@@ -1,4 +1,5 @@
-﻿from dataclasses import dataclass
+﻿
+from dataclasses import dataclass
 from enum import Enum
 import re
 from typing import Optional
@@ -28,26 +29,51 @@ class QueryRouter:
     graph, Git, retrieval, or LLM logic.
     """
 
+    # =========================================================
+    # CALLER PATTERNS
+    # =========================================================
+
     CALLER_PATTERNS = [
+        # Who calls Table.insert()?
         r"\bwho\s+calls\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
+
+        # What calls Table.insert()?
         r"\bwhat\s+calls\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
+
+        # Callers of Table.insert()
         r"\bcallers?\s+of\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
+
+        # Which methods call Table.insert()?
         r"\bwhich\s+(?:methods?|functions?|classes?)\s+call\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
     ]
 
+    # =========================================================
+    # CALLEE PATTERNS
+    # =========================================================
+
     CALLEE_PATTERNS = [
+        # What does Table.insert() call?
         r"\bwhat\s+does\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+call\b",
 
-        # FIX:
-        # Supports:
-        # "What functions does test_insert call?"
-        # "What methods does test_insert call?"
+        # What methods does Table.insert() call?
         r"\bwhat\s+(?:methods?|functions?)\s+does\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+call\b",
 
+        # Which methods does Table.insert() call?
         r"\bwhich\s+(?:methods?|functions?)\s+does\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+call\b",
+
+        # Callees of Table.insert()
         r"\bcallees?\s+of\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
-        r"\bwhat\s+(?:methods?|functions?)\s+(?:are|does)\s+called\s+by\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
+
+        # What methods are called by Table.insert()?
+        r"\bwhat\s+(?:methods?|functions?)\s+(?:are|is)\s+called\s+by\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
+
+        # Which methods are called by Table.insert()?
+        r"\bwhich\s+(?:methods?|functions?)\s+(?:are|is)\s+called\s+by\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
     ]
+
+    # =========================================================
+    # IMPACT PATTERNS
+    # =========================================================
 
     IMPACT_PATTERNS = [
         r"\bwhat\s+(?:will\s+be\s+)?affected\b",
@@ -59,6 +85,10 @@ class QueryRouter:
         r"\bdependencies\b",
         r"\baffected\s+(?:methods?|functions?|classes?|code)\b",
     ]
+
+    # =========================================================
+    # GIT HISTORY PATTERNS
+    # =========================================================
 
     GIT_PATTERNS = [
         r"\bwhy\s+was\b",
@@ -74,6 +104,10 @@ class QueryRouter:
         r"\bwhen\s+was\s+.+\s+changed\b",
     ]
 
+    # =========================================================
+    # FLOW PATTERNS
+    # =========================================================
+
     FLOW_PATTERNS = [
         r"\bhow\s+does\s+.+\s+work\b",
         r"\bhow\s+does\s+.+\s+flow\b",
@@ -87,6 +121,10 @@ class QueryRouter:
         r"\bdata\s+flow\b",
     ]
 
+    # =========================================================
+    # RETRIEVAL TRACE PATTERNS
+    # =========================================================
+
     RETRIEVAL_PATTERNS = [
         r"\bhow\s+did\s+you\s+find\b",
         r"\bhow\s+did\s+you\s+arrive\b",
@@ -97,6 +135,10 @@ class QueryRouter:
         r"\bretrieved\b",
         r"\bwhy\s+is\s+this\s+relevant\b",
     ]
+
+    # =========================================================
+    # STOPWORDS
+    # =========================================================
 
     STOPWORDS = {
         "a",
@@ -130,18 +172,22 @@ class QueryRouter:
         "things",
     }
 
+    # =========================================================
+    # MAIN ROUTER
+    # =========================================================
+
     @classmethod
     def route(cls, query: str) -> QueryRoute:
+
         query = (query or "").strip()
 
         if not query:
             return QueryRoute(QueryIntent.ANSWER)
 
-        # Most specific structural queries first.
+        # =====================================================
+        # CALLER QUERIES
+        # =====================================================
 
-        # -----------------------------
-        # Caller queries
-        # -----------------------------
         target = cls._extract_target(
             query,
             cls.CALLER_PATTERNS,
@@ -153,9 +199,10 @@ class QueryRouter:
                 target,
             )
 
-        # -----------------------------
-        # Callee queries
-        # -----------------------------
+        # =====================================================
+        # CALLEE QUERIES
+        # =====================================================
+
         target = cls._extract_target(
             query,
             cls.CALLEE_PATTERNS,
@@ -167,45 +214,66 @@ class QueryRouter:
                 target,
             )
 
-        # -----------------------------
-        # Impact queries
-        # -----------------------------
-        if cls._matches_any(query, cls.IMPACT_PATTERNS):
+        # =====================================================
+        # IMPACT QUERIES
+        # =====================================================
+
+        if cls._matches_any(
+            query,
+            cls.IMPACT_PATTERNS,
+        ):
             return QueryRoute(
                 QueryIntent.IMPACT,
                 cls._extract_entity_target(query),
             )
 
-        # -----------------------------
-        # Git history queries
-        # -----------------------------
-        if cls._matches_any(query, cls.GIT_PATTERNS):
+        # =====================================================
+        # GIT HISTORY QUERIES
+        # =====================================================
+
+        if cls._matches_any(
+            query,
+            cls.GIT_PATTERNS,
+        ):
             return QueryRoute(
                 QueryIntent.GIT_HISTORY,
                 cls._extract_entity_target(query),
             )
 
-        # -----------------------------
-        # Retrieval trace queries
-        # -----------------------------
-        if cls._matches_any(query, cls.RETRIEVAL_PATTERNS):
+        # =====================================================
+        # RETRIEVAL TRACE QUERIES
+        # =====================================================
+
+        if cls._matches_any(
+            query,
+            cls.RETRIEVAL_PATTERNS,
+        ):
             return QueryRoute(
                 QueryIntent.RETRIEVAL_TRACE,
             )
 
-        # -----------------------------
-        # Flow queries
-        # -----------------------------
-        if cls._matches_any(query, cls.FLOW_PATTERNS):
+        # =====================================================
+        # FLOW QUERIES
+        # =====================================================
+
+        if cls._matches_any(
+            query,
+            cls.FLOW_PATTERNS,
+        ):
             return QueryRoute(
                 QueryIntent.FLOW,
                 cls._extract_flow_target(query),
             )
 
-        # -----------------------------
-        # Normal RAG answer
-        # -----------------------------
+        # =====================================================
+        # NORMAL RAG ANSWER
+        # =====================================================
+
         return QueryRoute(QueryIntent.ANSWER)
+
+    # =========================================================
+    # EXTRACT TARGET
+    # =========================================================
 
     @classmethod
     def _extract_target(
@@ -213,7 +281,9 @@ class QueryRouter:
         query: str,
         patterns: list[str],
     ) -> Optional[str]:
+
         for pattern in patterns:
+
             match = re.search(
                 pattern,
                 query,
@@ -223,127 +293,168 @@ class QueryRouter:
             if not match:
                 continue
 
-            candidate = cls._clean_target(match.group(1))
+            candidate = cls._clean_target(
+                match.group(1)
+            )
 
             if cls._valid_target(candidate):
                 return candidate
 
         return None
+
+    # =========================================================
+    # MATCH ANY
+    # =========================================================
+
+    @staticmethod
+    def _matches_any(
+        query: str,
+        patterns: list[str],
+    ) -> bool:
+
+        return any(
+            re.search(
+                pattern,
+                query,
+                flags=re.IGNORECASE,
+            )
+            for pattern in patterns
+        )
+
+    # =========================================================
+    # EXTRACT FLOW TARGET
+    # =========================================================
 
     @classmethod
     def _extract_flow_target(
         cls,
         query: str,
     ) -> Optional[str]:
-        """
-        Extract a target only when the user explicitly names one.
-
-        Generic questions such as:
-            "How does the booking flow work?"
-        intentionally return None so the flow analyzer can infer
-        the relevant execution path from the indexed code.
-        """
 
         patterns = [
             r"\bflow\s+(?:of|for)\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
+
             r"\b(?:how|explain)\s+does\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+flow\b",
+
             r"\b(?:how|explain)\s+does\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+work\b",
+
             r"\bflow\s+(?:through|from)\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
         ]
 
         for pattern in patterns:
+
             match = re.search(
                 pattern,
                 query,
                 flags=re.IGNORECASE,
             )
 
-            if match:
-                candidate = cls._clean_target(match.group(1))
+            if not match:
+                continue
 
-                if cls._valid_target(candidate):
-                    return candidate
+            candidate = cls._clean_target(
+                match.group(1)
+            )
+
+            if cls._valid_target(candidate):
+                return candidate
 
         return None
+
+    # =========================================================
+    # EXTRACT ENTITY TARGET
+    # =========================================================
 
     @classmethod
     def _extract_entity_target(
         cls,
         query: str,
     ) -> Optional[str]:
-        """
-        Extract a likely code entity from structural questions.
-
-        Prefer identifiers appearing after structural keywords such as:
-        - change
-        - impact
-        - break
-        - about
-        - of
-        - flow
-        """
 
         contextual_patterns = [
             r"\b(?:change|changing|modify|modifying|edit|editing)\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
+
             r"\b(?:impact|affect|affects|affected|breaks|break)\s+(?:of\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
+
             r"\b(?:about|of|for|on)\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
+
             r"\b(?:flow|workflow)\s+(?:of|for)\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)",
         ]
 
         for pattern in contextual_patterns:
+
             match = re.search(
                 pattern,
                 query,
                 flags=re.IGNORECASE,
             )
 
-            if match:
-                candidate = cls._clean_target(match.group(1))
+            if not match:
+                continue
 
-                if cls._valid_target(candidate):
-                    return candidate
+            candidate = cls._clean_target(
+                match.group(1)
+            )
 
-        # For Git questions such as:
+            if cls._valid_target(candidate):
+                return candidate
+
+        # Git questions such as:
         # "Why was createBooking changed?"
-        # prefer the identifier immediately after "was" / "did".
+
         git_patterns = [
             r"\b(?:was|were)\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+changed\b",
+
             r"\b(?:did)\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+change\b",
+
             r"\b(?:has|have)\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s+changed\b",
         ]
 
         for pattern in git_patterns:
+
             match = re.search(
                 pattern,
                 query,
                 flags=re.IGNORECASE,
             )
 
-            if match:
-                candidate = cls._clean_target(match.group(1))
+            if not match:
+                continue
 
-                if cls._valid_target(candidate):
-                    return candidate
+            candidate = cls._clean_target(
+                match.group(1)
+            )
+
+            if cls._valid_target(candidate):
+                return candidate
 
         # Last-resort scan for an explicit code-style identifier.
+
         candidates = re.findall(
             r"\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?\b",
             query,
         )
 
         for candidate in candidates:
+
             if cls._valid_target(candidate):
                 return candidate
 
         return None
+
+    # =========================================================
+    # CLEAN TARGET
+    # =========================================================
 
     @classmethod
     def _clean_target(
         cls,
         value: str,
     ) -> str:
+
         value = str(value).strip()
 
+        # Table.insert() -> Table.insert
         if value.endswith("()"):
             value = value[:-2]
 
@@ -351,11 +462,21 @@ class QueryRouter:
             " \t\r\n.,;:!?\"'`()[]{}"
         )
 
+    # =========================================================
+    # VALID TARGET
+    # =========================================================
+
     @classmethod
     def _valid_target(
         cls,
         value: Optional[str],
     ) -> bool:
+
+        if not value:
+            return False
+
+        value = value.strip()
+
         if not value:
             return False
 
@@ -369,16 +490,3 @@ class QueryRouter:
             )
         )
 
-    @staticmethod
-    def _matches_any(
-        query: str,
-        patterns: list[str],
-    ) -> bool:
-        return any(
-            re.search(
-                pattern,
-                query,
-                flags=re.IGNORECASE,
-            )
-            for pattern in patterns
-        )

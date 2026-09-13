@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional, Tuple
+
 import re
 
 from src.vector_store import VectorStore
@@ -122,7 +123,6 @@ class CodeIntelligenceEngine:
         retrieved_chunks: List[Dict[str, Any]] = []
 
         for caller in callers[:top_k]:
-
             class_name, caller_method = self._split_method_id(caller)
 
             retrieved_chunks.append(
@@ -177,7 +177,6 @@ class CodeIntelligenceEngine:
         retrieved_chunks: List[Dict[str, Any]] = []
 
         for callee in callees[:top_k]:
-
             class_name, callee_method = self._split_method_id(callee)
 
             retrieved_chunks.append(
@@ -230,24 +229,14 @@ class CodeIntelligenceEngine:
             return None
 
         patterns = [
-            # Who calls bookEquipment?
             r"\bwho\s+calls\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
-
-            # What calls bookEquipment?
             r"\bwhat\s+calls\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
-
-            # Callers of bookEquipment
             r"\bcallers?\s+of\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
-
-            # Which methods call bookEquipment?
             r"\bwhich\s+(?:methods?|functions?)\s+call\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
-
-            # Which classes call bookEquipment?
             r"\bwhich\s+classes?\s+call\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
         ]
 
         for pattern in patterns:
-
             match = re.search(
                 pattern,
                 query,
@@ -269,17 +258,6 @@ class CodeIntelligenceEngine:
             if cls._is_stopword_candidate(candidate):
                 continue
 
-            # -------------------------------------------------------
-            # CRITICAL VALIDATION
-            #
-            # Do not route a natural-language word to the graph.
-            # Example:
-            #
-            # "Which methods call other methods related to booking?"
-            #
-            # "other" must NOT become a method target.
-            # -------------------------------------------------------
-
             return candidate
 
         return None
@@ -294,21 +272,13 @@ class CodeIntelligenceEngine:
             return None
 
         patterns = [
-            # What does bookEquipment call?
             r"\bwhat\s+does\s+([A-Za-z_$][\w$]*(?:\(\))?)\s+call\b",
-
-            # Which methods does bookEquipment call?
             r"\bwhich\s+(?:methods?|functions?)\s+does\s+([A-Za-z_$][\w$]*(?:\(\))?)\s+call\b",
-
-            # Callees of bookEquipment
             r"\bcallees?\s+of\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
-
-            # What methods are called by bookEquipment?
             r"\bwhat\s+(?:methods?|functions?)\s+(?:are|does)\s+called\s+by\s+([A-Za-z_$][\w$]*(?:\(\))?)\b",
         ]
 
         for pattern in patterns:
-
             match = re.search(
                 pattern,
                 query,
@@ -348,12 +318,10 @@ class CodeIntelligenceEngine:
 
         value = str(method_name).strip()
 
-        # Remove surrounding punctuation.
         value = value.strip(
             " \t\r\n.,;:!?\"'`()[]{}"
         )
 
-        # Remove trailing parentheses.
         if value.endswith("()"):
             value = value[:-2]
 
@@ -366,17 +334,6 @@ class CodeIntelligenceEngine:
 
         if not method_name:
             return False
-
-        # Supports:
-        #
-        # booking
-        # bookEquipment
-        # _bookEquipment
-        # $helper
-        #
-        # Also supports class-qualified names:
-        #
-        # BookingService.bookEquipment
 
         return bool(
             re.fullmatch(
@@ -527,7 +484,6 @@ class CodeIntelligenceEngine:
 
             node_data = self.graph_db.graph.nodes[node]
 
-            # Only real method nodes.
             if node_data.get("type") != "METHOD":
                 continue
 
@@ -581,7 +537,6 @@ class CodeIntelligenceEngine:
 
             node_data = self.graph_db.graph.nodes[node]
 
-            # Only real method nodes.
             if node_data.get("type") != "METHOD":
                 continue
 
@@ -645,6 +600,7 @@ class CodeIntelligenceEngine:
             clean = clean[:-2]
 
         if "." in clean:
+
             class_name, method_name = clean.rsplit(
                 ".",
                 1,
@@ -669,124 +625,214 @@ class CodeIntelligenceEngine:
                 "No relevant code was found in the indexed repository."
             )
 
-        lines: List[str] = []
+        # -----------------------------------------------------------
+        # Use the highest-ranked retrieved chunk as the main answer.
+        # The frontend already displays all retrieved chunks below
+        # the answer, so we should NOT duplicate them here.
+        # -----------------------------------------------------------
 
-        lines.append(
-            f'Based on the indexed codebase, the most relevant code '
-            f'for the query "{query}" is:'
+        top_chunk = chunks[0]
+
+        class_name = (
+            top_chunk.get("class_name")
+            or ""
         )
 
-        for index, chunk in enumerate(
-            chunks,
-            start=1,
+        method_name = (
+            top_chunk.get("method_name")
+            or ""
+        )
+
+        code = (
+            top_chunk.get("code_content")
+            or top_chunk.get("text_representation")
+            or ""
+        )
+
+        # -----------------------------------------------------------
+        # Identify the main symbol
+        # -----------------------------------------------------------
+
+        if class_name and method_name:
+            symbol = f"{class_name}.{method_name}"
+        elif method_name:
+            symbol = method_name
+        elif class_name:
+            symbol = class_name
+        else:
+            symbol = "The retrieved code"
+
+        # -----------------------------------------------------------
+        # Special case: count queries
+        # -----------------------------------------------------------
+
+        count_words = (
+            "count",
+            "number",
+            "how many",
+            "matching documents",
+            "matching records",
+        )
+
+        query_lower = query.lower()
+
+        if (
+            any(word in query_lower for word in count_words)
+            and method_name.lower() == "count"
         ):
-
-            file_name = (
-                chunk.get("file_name")
-                or chunk.get("file_path")
-                or "Unknown file"
-            )
-
-            class_name = chunk.get(
-                "class_name",
-                "",
-            )
-
-            method_name = chunk.get(
-                "method_name",
-                "",
-            )
-
-            chunk_type = chunk.get(
-                "chunk_type",
-                "METHOD",
-            )
-
-            callers = chunk.get(
-                "graph_callers",
-                [],
-            )
-
-            callees = chunk.get(
-                "graph_callees",
-                [],
-            )
-
-            lines.append("")
-
-            lines.append(
-                f"{index}. {file_name}"
-            )
-
-            if class_name:
-                lines.append(
-                    f"   Class: {class_name}"
+            if "search(" in code:
+                return (
+                    f"`{symbol}()` counts matching documents "
+                    f"by searching for documents that satisfy "
+                    f"the given condition and returning the "
+                    f"number of results."
                 )
 
-            if method_name:
-                lines.append(
-                    f"   Method: {method_name}"
-                )
-
-            lines.append(
-                f"   Type: {chunk_type}"
+            return (
+                f"`{symbol}()` is responsible for counting "
+                f"documents that match the given condition."
             )
 
-            if callers:
-                lines.append(
-                    "   Callers: "
-                    + ", ".join(
-                        map(str, callers)
-                    )
-                )
+        # -----------------------------------------------------------
+        # Insert / add / create queries
+        # -----------------------------------------------------------
 
-            if callees:
-                lines.append(
-                    "   Callees: "
-                    + ", ".join(
-                        map(str, callees)
-                    )
-                )
+        insert_words = (
+            "insert",
+            "add",
+            "create a document",
+            "add a document",
+            "new record",
+            "new document",
+        )
 
-            code = (
-                chunk.get("code_content")
-                or chunk.get("text_representation")
-                or ""
+        if (
+            any(word in query_lower for word in insert_words)
+            and method_name.lower() in {
+                "insert",
+                "insert_multiple",
+            }
+        ):
+            return (
+                f"`{symbol}()` handles adding documents "
+                f"to the database."
             )
+
+        # -----------------------------------------------------------
+        # Search / find queries
+        # -----------------------------------------------------------
+
+        search_words = (
+            "search",
+            "find",
+            "matching",
+            "satisfy a condition",
+            "satisfy the condition",
+        )
+
+        if (
+            any(word in query_lower for word in search_words)
+            and method_name.lower() == "search"
+        ):
+            return (
+                f"`{symbol}()` finds documents that match "
+                f"the supplied query or condition."
+            )
+
+        # -----------------------------------------------------------
+        # Delete queries
+        # -----------------------------------------------------------
+
+        delete_words = (
+            "delete",
+            "remove",
+            "removing",
+        )
+
+        if (
+            any(word in query_lower for word in delete_words)
+            and method_name.lower() in {
+                "remove",
+                "remove_multiple",
+            }
+        ):
+            return (
+                f"`{symbol}()` handles removing documents "
+                f"from the database."
+            )
+
+        # -----------------------------------------------------------
+        # Update queries
+        # -----------------------------------------------------------
+
+        update_words = (
+            "update",
+            "modify",
+            "change",
+        )
+
+        if (
+            any(word in query_lower for word in update_words)
+            and method_name.lower() in {
+                "update",
+                "update_multiple",
+                "upsert",
+            }
+        ):
+            return (
+                f"`{symbol}()` handles updating documents "
+                f"that match the supplied condition."
+            )
+
+        # -----------------------------------------------------------
+        # Generic method explanation
+        # -----------------------------------------------------------
+
+        if method_name:
 
             if code:
 
-                code_preview = str(
-                    code
-                ).strip()
+                first_line = ""
 
-                if len(code_preview) > 500:
-                    code_preview = (
-                        code_preview[:500]
-                        + "..."
+                for line in str(code).splitlines():
+                    cleaned = line.strip()
+
+                    if not cleaned:
+                        continue
+
+                    if cleaned.startswith("def "):
+                        continue
+
+                    if cleaned.startswith("class "):
+                        continue
+
+                    if cleaned.startswith("#"):
+                        continue
+
+                    first_line = cleaned
+                    break
+
+                if first_line:
+                    return (
+                        f"The most relevant implementation is "
+                        f"`{symbol}()`. "
+                        f"It contains the logic related to your query. "
+                        f"The retrieved code shows: "
+                        f"`{first_line}`"
                     )
 
-                lines.append(
-                    "   Code:\n"
-                    + self._indent_code(
-                        code_preview
-                    )
-                )
+            return (
+                f"The most relevant implementation for your "
+                f"query is `{symbol}()`."
+            )
 
-        return "\n".join(lines)
+        # -----------------------------------------------------------
+        # Final fallback
+        # -----------------------------------------------------------
 
-    # ===============================================================
-    # UTILITY
-    # ===============================================================
-
-    @staticmethod
-    def _indent_code(
-        code: str,
-    ) -> str:
-
-        return "\n".join(
-            "      " + line
-            for line in code.splitlines()
+        return (
+            "The indexed codebase contains relevant code for "
+            f"your query. The most relevant result is `{symbol}`."
         )
 
     # ===============================================================
@@ -869,9 +915,7 @@ class CodeIntelligenceEngine:
             self.context_builder,
             "explain_why_changed",
         ):
-
             try:
-
                 return (
                     self.context_builder
                     .explain_why_changed(
@@ -883,7 +927,6 @@ class CodeIntelligenceEngine:
                 )
 
             except Exception as e:
-
                 return {
                     "answer": (
                         f"Unable to perform provenance "

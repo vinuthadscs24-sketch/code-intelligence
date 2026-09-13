@@ -1,4 +1,6 @@
+
 from typing import List, Dict, Any
+import re
 
 from src.vector_store import VectorStore
 from src.graph_builder import CodeKnowledgeGraph
@@ -19,26 +21,21 @@ WEB_ANNOTATIONS = {
 
 class HybridRetriever:
     """
-    Combines semantic vector retrieval and structural graph retrieval.
+    Hybrid code retrieval using:
 
-    Pipeline:
-
-        Query
-          |
-          +------------------+
-          |                  |
-          v                  v
-      Vector Search      Graph Search
-          |                  |
-          +--------+---------+
-                   |
-             Weighted RRF
-                   |
-            Endpoint Boost
-                   |
-            File Diversity
-                   |
-                Top-K
+        Vector Search
+             +
+        Graph Search
+             +
+        Semantic Matching
+             +
+        Weighted RRF
+             +
+        Code Intent Matching
+             +
+        Endpoint Boost
+             +
+        File Diversity
     """
 
     def __init__(
@@ -52,10 +49,8 @@ class HybridRetriever:
     ):
         self.vector_store = vector_store
         self.kg = knowledge_graph
-
         self.rrf_k = rrf_k
         self.max_per_file = max_per_file
-
         self.vector_weight = vector_weight
         self.graph_weight = graph_weight
 
@@ -63,10 +58,14 @@ class HybridRetriever:
             raise ValueError("rrf_k must be greater than 0.")
 
         if self.max_per_file <= 0:
-            raise ValueError("max_per_file must be greater than 0.")
+            raise ValueError(
+                "max_per_file must be greater than 0."
+            )
 
         if self.vector_weight < 0 or self.graph_weight < 0:
-            raise ValueError("Retrieval weights cannot be negative.")
+            raise ValueError(
+                "Retrieval weights cannot be negative."
+            )
 
         if self.vector_weight == 0 and self.graph_weight == 0:
             raise ValueError(
@@ -74,19 +73,14 @@ class HybridRetriever:
                 "must be greater than 0."
             )
 
-    # ------------------------------------------------------------------
-    # Utility methods
-    # ------------------------------------------------------------------
+    # ==============================================================
+    # UTILITY
+    # ==============================================================
 
-    def _get_chunk_id(self, chunk: Dict[str, Any]) -> str:
-        """
-        Returns a stable identifier for a retrieved chunk.
-
-        Priority:
-            1. chunk_id
-            2. id
-            3. derived identifier
-        """
+    def _get_chunk_id(
+        self,
+        chunk: Dict[str, Any],
+    ) -> str:
 
         if chunk.get("chunk_id"):
             return str(chunk["chunk_id"])
@@ -96,7 +90,13 @@ class HybridRetriever:
 
         file_name = chunk.get(
             "file_name",
-            chunk.get("file", chunk.get("file_path", "unknown")),
+            chunk.get(
+                "file",
+                chunk.get(
+                    "file_path",
+                    "unknown",
+                ),
+            ),
         )
 
         class_name = chunk.get(
@@ -109,14 +109,22 @@ class HybridRetriever:
             chunk.get("method", ""),
         )
 
-        start_line = chunk.get("start_line", 0)
+        start_line = chunk.get(
+            "start_line",
+            0,
+        )
 
-        return f"{file_name}::{class_name}::{method_name}:{start_line}"
+        return (
+            f"{file_name}::"
+            f"{class_name}::"
+            f"{method_name}:"
+            f"{start_line}"
+        )
 
-    def _get_file_key(self, chunk: Dict[str, Any]) -> str:
-        """
-        Returns the file identifier used for diversity control.
-        """
+    def _get_file_key(
+        self,
+        chunk: Dict[str, Any],
+    ) -> str:
 
         return str(
             chunk.get("file_name")
@@ -126,14 +134,10 @@ class HybridRetriever:
             or "unknown"
         )
 
-    def _clean_annotations(self, annotations: Any) -> set:
-        """
-        Normalizes annotations.
-
-        Examples:
-            @RestController -> RestController
-            RestController  -> RestController
-        """
+    def _clean_annotations(
+        self,
+        annotations: Any,
+    ) -> set:
 
         if not annotations:
             return set()
@@ -150,34 +154,33 @@ class HybridRetriever:
             for annotation in annotations
         }
 
-    # ------------------------------------------------------------------
-    # Graph Retrieval
-    # ------------------------------------------------------------------
+    # ==============================================================
+    # QUERY TOKENIZATION
+    # ==============================================================
 
-    def _get_graph_tokens(self, query: str) -> List[str]:
-        """
-        Extracts simple searchable tokens from the query.
+    def _tokenize(
+        self,
+        text: str,
+    ) -> List[str]:
 
-        This is intentionally lightweight for V1.
-        A future version can replace this with entity extraction.
-        """
-
-        normalized_query = (
-            query.replace(".", " ")
-            .replace("(", " ")
-            .replace(")", " ")
-            .replace(",", " ")
-            .replace(":", " ")
-            .replace("/", " ")
-            .replace("_", " ")
-            .replace("-", " ")
+        text = re.sub(
+            r"[^a-zA-Z0-9_]",
+            " ",
+            text,
         )
 
-        tokens = [
+        return [
             token.lower()
-            for token in normalized_query.split()
+            for token in text.split()
             if len(token) > 2
         ]
+
+    def _get_graph_tokens(
+        self,
+        query: str,
+    ) -> List[str]:
+
+        tokens = self._tokenize(query)
 
         stop_words = {
             "the",
@@ -205,6 +208,13 @@ class HybridRetriever:
             "explain",
             "work",
             "works",
+            "can",
+            "all",
+            "records",
+            "data",
+            "code",
+            "using",
+            "use",
         }
 
         return [
@@ -213,16 +223,238 @@ class HybridRetriever:
             if token not in stop_words
         ]
 
+    # ==============================================================
+    # QUERY INTENT
+    # ==============================================================
+
+    def _query_intent_tokens(
+        self,
+        query: str,
+    ) -> List[str]:
+
+        tokens = self._tokenize(query)
+
+        stop_words = {
+            "the",
+            "and",
+            "how",
+            "what",
+            "where",
+            "which",
+            "who",
+            "does",
+            "with",
+            "from",
+            "this",
+            "that",
+            "are",
+            "was",
+            "were",
+            "for",
+            "into",
+            "about",
+            "show",
+            "find",
+            "tell",
+            "give",
+            "explain",
+            "can",
+            "all",
+            "is",
+            "to",
+            "of",
+            "a",
+            "an",
+        }
+
+        return [
+            token
+            for token in tokens
+            if token not in stop_words
+        ]
+
+    # ==============================================================
+    # CODE INTENT
+    # ==============================================================
+
+    def _detect_code_intent(
+        self,
+        query: str,
+    ) -> str | None:
+
+        query_lower = query.lower()
+
+        intent_aliases = {
+            "search": [
+                "find",
+                "search",
+                "retrieve",
+                "matching",
+                "satisfy a condition",
+                "find records",
+                "find documents",
+                "search records",
+                "search documents",
+            ],
+            "insert": [
+                "insert",
+                "add",
+                "store",
+                "create record",
+                "add record",
+            ],
+            "remove": [
+                "delete",
+                "remove",
+                "erase",
+            ],
+            "update": [
+                "update",
+                "modify",
+                "change",
+            ],
+            "count": [
+                "count",
+                "how many",
+                "number of",
+            ],
+            "contains": [
+                "contains",
+                "exists",
+                "check whether",
+            ],
+        }
+
+        for intent, aliases in intent_aliases.items():
+            if any(
+                alias in query_lower
+                for alias in aliases
+            ):
+                return intent
+
+        return None
+
+    # ==============================================================
+    # SEMANTIC / TEXT MATCHING
+    # ==============================================================
+
+    def _semantic_score(
+        self,
+        query: str,
+        chunk: Dict[str, Any],
+    ) -> float:
+
+        query_tokens = set(
+            self._query_intent_tokens(query)
+        )
+
+        if not query_tokens:
+            return 0.0
+
+        method_name = str(
+            chunk.get("method_name")
+            or ""
+        ).lower()
+
+        class_name = str(
+            chunk.get("class_name")
+            or ""
+        ).lower()
+
+        code = str(
+            chunk.get("code_content")
+            or chunk.get("text_representation")
+            or ""
+        ).lower()
+
+        file_name = str(
+            chunk.get("file_name")
+            or ""
+        ).lower()
+
+        method_tokens = set(
+            self._tokenize(method_name)
+        )
+
+        class_tokens = set(
+            self._tokenize(class_name)
+        )
+
+        code_tokens = set(
+            self._tokenize(code)
+        )
+
+        file_tokens = set(
+            self._tokenize(file_name)
+        )
+
+        score = 0.0
+
+        # ----------------------------------------------------------
+        # Method name
+        # ----------------------------------------------------------
+
+        method_matches = query_tokens.intersection(
+            method_tokens
+        )
+
+        score += len(method_matches) * 0.30
+
+        # ----------------------------------------------------------
+        # Class name
+        # ----------------------------------------------------------
+
+        class_matches = query_tokens.intersection(
+            class_tokens
+        )
+
+        score += len(class_matches) * 0.15
+
+        # ----------------------------------------------------------
+        # Code content
+        # ----------------------------------------------------------
+
+        code_matches = query_tokens.intersection(
+            code_tokens
+        )
+
+        score += len(code_matches) * 0.05
+
+        # ----------------------------------------------------------
+        # File name
+        # ----------------------------------------------------------
+
+        file_matches = query_tokens.intersection(
+            file_tokens
+        )
+
+        score += len(file_matches) * 0.05
+
+        # ----------------------------------------------------------
+        # CODE INTENT BOOST
+        # ----------------------------------------------------------
+
+        intent = self._detect_code_intent(query)
+
+        if intent == method_name:
+            score += 0.50
+
+        return min(score, 1.0)
+
+    # ==============================================================
+    # GRAPH RETRIEVAL
+    # ==============================================================
+
     def _independent_graph_search(
         self,
         query: str,
         top_k: int,
     ) -> List[Dict[str, Any]]:
-        """
-        Performs graph retrieval independently of vector retrieval.
-        """
 
-        if not hasattr(self.kg, "graph") or self.kg.graph is None:
+        if (
+            not hasattr(self.kg, "graph")
+            or self.kg.graph is None
+        ):
             return []
 
         tokens = self._get_graph_tokens(query)
@@ -232,7 +464,10 @@ class HybridRetriever:
 
         candidates = []
 
-        for node, data in self.kg.graph.nodes(data=True):
+        for node, data in self.kg.graph.nodes(
+            data=True
+        ):
+
             node_string = str(node)
             node_lower = node_string.lower()
 
@@ -245,20 +480,35 @@ class HybridRetriever:
             if not matched_tokens:
                 continue
 
-            match_score = len(matched_tokens) / len(tokens)
+            match_score = (
+                len(matched_tokens)
+                / len(tokens)
+            )
 
             callers = []
             callees = []
 
-            if hasattr(self.kg, "get_callers_of"):
+            if hasattr(
+                self.kg,
+                "get_callers_of",
+            ):
                 try:
-                    callers = self.kg.get_callers_of(node) or []
+                    callers = (
+                        self.kg.get_callers_of(node)
+                        or []
+                    )
                 except Exception:
                     callers = []
 
-            if hasattr(self.kg, "get_calls_from"):
+            if hasattr(
+                self.kg,
+                "get_calls_from",
+            ):
                 try:
-                    callees = self.kg.get_calls_from(node) or []
+                    callees = (
+                        self.kg.get_calls_from(node)
+                        or []
+                    )
                 except Exception:
                     callees = []
 
@@ -278,11 +528,18 @@ class HybridRetriever:
                 chunk_id_string = str(chunk_id)
 
                 if "::" in chunk_id_string:
-                    file_name = chunk_id_string.split("::")[0]
+                    file_name = (
+                        chunk_id_string.split(
+                            "::"
+                        )[0]
+                    )
                 else:
                     file_name = "unknown"
 
-            annotations = data.get("annotations", [])
+            annotations = data.get(
+                "annotations",
+                [],
+            )
 
             code_content = (
                 data.get("code_content")
@@ -298,7 +555,10 @@ class HybridRetriever:
                         data.get("method_name")
                         or node
                     ),
-                    "class_name": data.get("class_name", ""),
+                    "class_name": data.get(
+                        "class_name",
+                        "",
+                    ),
                     "annotations": annotations,
                     "graph_callers": callers,
                     "graph_callees": callees,
@@ -307,62 +567,59 @@ class HybridRetriever:
                         match_score,
                         6,
                     ),
-                    "graph_matched_tokens": matched_tokens,
+                    "graph_matched_tokens": (
+                        matched_tokens
+                    ),
                 }
             )
 
         candidates.sort(
             key=lambda item: (
-                item.get("graph_match_score", 0),
-                len(item.get("graph_callers", []))
-                + len(item.get("graph_callees", [])),
+                item.get(
+                    "graph_match_score",
+                    0,
+                ),
+                len(
+                    item.get(
+                        "graph_callers",
+                        [],
+                    )
+                )
+                + len(
+                    item.get(
+                        "graph_callees",
+                        [],
+                    )
+                ),
             ),
             reverse=True,
         )
 
         return candidates[:top_k]
 
-    # ------------------------------------------------------------------
+    # ==============================================================
     # RRF
-    # ------------------------------------------------------------------
+    # ==============================================================
 
     def _rrf_score(
         self,
         rank: int,
         weight: float,
     ) -> float:
-        """
-        Weighted Reciprocal Rank Fusion contribution.
 
-        Formula:
+        return weight / (
+            self.rrf_k + rank
+        )
 
-            weight / (rrf_k + rank)
-        """
-
-        return weight / (self.rrf_k + rank)
-
-    # ------------------------------------------------------------------
-    # Main Search
-    # ------------------------------------------------------------------
+    # ==============================================================
+    # MAIN SEARCH
+    # ==============================================================
 
     def search(
         self,
         query: str,
         top_k: int = 5,
     ) -> List[Dict[str, Any]]:
-        """
-        Performs hybrid retrieval.
-
-        Returns ranked code chunks containing:
-
-            combined_score
-            sources
-            vector_rank
-            graph_rank
-            graph_callers
-            graph_callees
-            code metadata
-        """
 
         if not query or not query.strip():
             return []
@@ -370,42 +627,68 @@ class HybridRetriever:
         if top_k <= 0:
             return []
 
-        fetch_limit = max(top_k * 4, 10)
-
-        # ==============================================================
-        # 1. VECTOR RETRIEVAL
-        # ==============================================================
-
-        raw_vector_results = self.vector_store.search(
-            query,
-            top_k=fetch_limit,
+        # IMPORTANT:
+        # Fetch deeper candidates so that a relevant method
+        # such as Table.search is not lost before reranking.
+        fetch_limit = max(
+            top_k * 10,
+            50,
         )
 
-        vector_chunks: List[Dict[str, Any]] = []
+        # ==========================================================
+        # 1. VECTOR RETRIEVAL
+        # ==========================================================
+
+        raw_vector_results = (
+            self.vector_store.search(
+                query,
+                top_k=fetch_limit,
+            )
+        )
+
+        vector_chunks: List[
+            Dict[str, Any]
+        ] = []
 
         for result in raw_vector_results:
-            if isinstance(result, tuple):
+
+            if isinstance(
+                result,
+                tuple,
+            ):
                 if (
                     len(result) > 0
-                    and isinstance(result[0], dict)
+                    and isinstance(
+                        result[0],
+                        dict,
+                    )
                 ):
-                    vector_chunks.append(result[0])
+                    vector_chunks.append(
+                        result[0]
+                    )
 
-            elif isinstance(result, dict):
-                vector_chunks.append(result)
+            elif isinstance(
+                result,
+                dict,
+            ):
+                vector_chunks.append(
+                    result
+                )
 
-        # ==============================================================
-        # 2. INDEPENDENT GRAPH RETRIEVAL
-        # ==============================================================
+        # ==========================================================
+        # 2. GRAPH RETRIEVAL
+        # ==========================================================
 
-        graph_chunks = self._independent_graph_search(
-            query,
-            top_k=fetch_limit,
+        graph_chunks = (
+            self._independent_graph_search(
+                query,
+                top_k=fetch_limit,
+            )
         )
 
-        # ==============================================================
+        # ==========================================================
         # 3. QUERY INTENT
-        # ==============================================================
+        # ==========================================================
 
         query_lower = query.lower()
 
@@ -425,13 +708,30 @@ class HybridRetriever:
             for keyword in endpoint_keywords
         )
 
-        # ==============================================================
-        # 4. WEIGHTED RRF
-        # ==============================================================
+        # ==========================================================
+        # 4. CODE-SYMBOL QUERY
+        # ==========================================================
 
-        rrf_scores: Dict[str, float] = {}
+        code_symbol_query = bool(
+            re.search(
+                r"\b[a-zA-Z_][a-zA-Z0-9_]*\s*\(",
+                query,
+            )
+        )
 
-        doc_map: Dict[str, Dict[str, Any]] = {}
+        # ==========================================================
+        # 5. MERGE RESULTS
+        # ==========================================================
+
+        rrf_scores: Dict[
+            str,
+            float,
+        ] = {}
+
+        doc_map: Dict[
+            str,
+            Dict[str, Any],
+        ] = {}
 
         def merge_result(
             chunk: Dict[str, Any],
@@ -440,39 +740,116 @@ class HybridRetriever:
             source_type: str,
         ) -> None:
 
-            chunk_id = self._get_chunk_id(chunk)
+            chunk_id = self._get_chunk_id(
+                chunk
+            )
 
             if chunk_id not in doc_map:
 
-                doc_map[chunk_id] = dict(chunk)
+                doc_map[chunk_id] = dict(
+                    chunk
+                )
 
-                doc_map[chunk_id]["sources"] = []
+                doc_map[chunk_id][
+                    "sources"
+                ] = []
 
-                doc_map[chunk_id]["vector_rank"] = None
-                doc_map[chunk_id]["graph_rank"] = None
+                doc_map[chunk_id][
+                    "vector_rank"
+                ] = None
 
-            document = doc_map[chunk_id]
+                doc_map[chunk_id][
+                    "graph_rank"
+                ] = None
 
-            # ----------------------------------------------------------
-            # Source tracking
-            # ----------------------------------------------------------
+            document = doc_map[
+                chunk_id
+            ]
 
-            if source_type not in document["sources"]:
-                document["sources"].append(source_type)
+            # ------------------------------------------------------
+            # Source
+            # ------------------------------------------------------
 
-            # ----------------------------------------------------------
-            # Rank tracking
-            # ----------------------------------------------------------
+            is_new_source = (
+                source_type
+                not in document["sources"]
+            )
+
+            if is_new_source:
+                document[
+                    "sources"
+                ].append(
+                    source_type
+                )
+
+            # ------------------------------------------------------
+            # Rank
+            # ------------------------------------------------------
 
             if source_type == "vector":
-                document["vector_rank"] = rank
+
+                # Keep the BEST vector rank.
+                existing_rank = document.get(
+                    "vector_rank"
+                )
+
+                if (
+                    existing_rank is None
+                    or rank < existing_rank
+                ):
+                    document[
+                        "vector_rank"
+                    ] = rank
+
+                # Preserve actual vector similarity.
+                if (
+                    chunk.get("score")
+                    is not None
+                ):
+                    try:
+
+                        current_score = float(
+                            chunk["score"]
+                        )
+
+                        previous_score = (
+                            document.get(
+                                "vector_score"
+                            )
+                        )
+
+                        if (
+                            previous_score is None
+                            or current_score
+                            > float(previous_score)
+                        ):
+                            document[
+                                "vector_score"
+                            ] = current_score
+
+                    except (
+                        TypeError,
+                        ValueError,
+                    ):
+                        pass
 
             elif source_type == "graph":
-                document["graph_rank"] = rank
 
-            # ----------------------------------------------------------
-            # Merge graph information
-            # ----------------------------------------------------------
+                existing_rank = document.get(
+                    "graph_rank"
+                )
+
+                if (
+                    existing_rank is None
+                    or rank < existing_rank
+                ):
+                    document[
+                        "graph_rank"
+                    ] = rank
+
+            # ------------------------------------------------------
+            # Graph metadata
+            # ------------------------------------------------------
 
             for graph_key in (
                 "graph_callers",
@@ -481,12 +858,19 @@ class HybridRetriever:
                 "graph_matched_tokens",
             ):
 
-                if graph_key in chunk and chunk[graph_key]:
-                    document[graph_key] = chunk[graph_key]
+                if (
+                    graph_key in chunk
+                    and chunk[graph_key]
+                ):
+                    document[
+                        graph_key
+                    ] = chunk[
+                        graph_key
+                    ]
 
-            # ----------------------------------------------------------
-            # Merge useful metadata
-            # ----------------------------------------------------------
+            # ------------------------------------------------------
+            # Metadata
+            # ------------------------------------------------------
 
             for key in (
                 "file_name",
@@ -495,32 +879,54 @@ class HybridRetriever:
                 "method_name",
                 "annotations",
                 "code_content",
+                "text_representation",
                 "start_line",
                 "end_line",
             ):
 
-                if not document.get(key) and chunk.get(key):
+                if (
+                    not document.get(key)
+                    and chunk.get(key)
+                ):
                     document[key] = chunk[key]
 
-            # ----------------------------------------------------------
-            # RRF contribution
-            # ----------------------------------------------------------
+            # ------------------------------------------------------
+            # RRF
+            #
+            # IMPORTANT:
+            # Only count each source once per chunk.
+            # This prevents duplicate vector entries from
+            # artificially inflating the score.
+            # ------------------------------------------------------
 
-            contribution = self._rrf_score(
-                rank=rank,
-                weight=weight,
-            )
+            if is_new_source:
 
-            rrf_scores[chunk_id] = (
-                rrf_scores.get(chunk_id, 0.0)
-                + contribution
-            )
+                contribution = (
+                    self._rrf_score(
+                        rank=rank,
+                        weight=weight,
+                    )
+                )
 
-        # Vector ranking
+                rrf_scores[
+                    chunk_id
+                ] = (
+                    rrf_scores.get(
+                        chunk_id,
+                        0.0,
+                    )
+                    + contribution
+                )
+
+        # ----------------------------------------------------------
+        # Vector results
+        # ----------------------------------------------------------
+
         for rank, chunk in enumerate(
             vector_chunks,
             start=1,
         ):
+
             merge_result(
                 chunk=chunk,
                 rank=rank,
@@ -528,11 +934,15 @@ class HybridRetriever:
                 source_type="vector",
             )
 
-        # Graph ranking
+        # ----------------------------------------------------------
+        # Graph results
+        # ----------------------------------------------------------
+
         for rank, chunk in enumerate(
             graph_chunks,
             start=1,
         ):
+
             merge_result(
                 chunk=chunk,
                 rank=rank,
@@ -540,63 +950,207 @@ class HybridRetriever:
                 source_type="graph",
             )
 
-        # ==============================================================
-        # 5. ENDPOINT BOOST
-        # ==============================================================
+        # ==========================================================
+        # 6. BUILD FINAL SCORE
+        # ==========================================================
+
+        final_scores: Dict[
+            str,
+            float,
+        ] = {}
+
+        for chunk_id, rrf_score in (
+            rrf_scores.items()
+        ):
+
+            chunk = doc_map[
+                chunk_id
+            ]
+
+            # ------------------------------------------------------
+            # Vector score
+            # ------------------------------------------------------
+
+            vector_score = 0.0
+
+            if chunk.get(
+                "vector_score"
+            ) is not None:
+
+                try:
+                    vector_score = float(
+                        chunk[
+                            "vector_score"
+                        ]
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    vector_score = 0.0
+
+            vector_score = max(
+                0.0,
+                min(
+                    1.0,
+                    vector_score,
+                ),
+            )
+
+            # ------------------------------------------------------
+            # Semantic score
+            # ------------------------------------------------------
+
+            semantic_score = (
+                self._semantic_score(
+                    query,
+                    chunk,
+                )
+            )
+
+            # ------------------------------------------------------
+            # Graph score
+            # ------------------------------------------------------
+
+            graph_score = float(
+                chunk.get(
+                    "graph_match_score",
+                    0.0,
+                )
+                or 0.0
+            )
+
+            # ------------------------------------------------------
+            # Base score
+            # ------------------------------------------------------
+
+            score = rrf_score
+
+            # Vector similarity.
+            score += (
+                vector_score * 0.20
+            )
+
+            # Textual relevance + code intent.
+            score += (
+                semantic_score * 0.20
+            )
+
+            # Graph relevance.
+            if graph_score > 0:
+
+                graph_multiplier = 0.10
+
+                if code_symbol_query:
+                    graph_multiplier = 0.20
+
+                score += (
+                    graph_score
+                    * graph_multiplier
+                )
+
+            final_scores[
+                chunk_id
+            ] = score
+
+            chunk[
+                "semantic_score"
+            ] = round(
+                semantic_score,
+                6,
+            )
+
+            chunk[
+                "vector_score"
+            ] = round(
+                vector_score,
+                6,
+            )
+
+        # ==========================================================
+        # 7. ENDPOINT BOOST
+        # ==========================================================
 
         if is_endpoint_query:
 
-            for chunk_id in rrf_scores:
+            for chunk_id in final_scores:
 
-                annotations = self._clean_annotations(
-                    doc_map[chunk_id].get(
-                        "annotations",
-                        [],
+                annotations = (
+                    self._clean_annotations(
+                        doc_map[
+                            chunk_id
+                        ].get(
+                            "annotations",
+                            [],
+                        )
                     )
                 )
 
                 if annotations.intersection(
                     WEB_ANNOTATIONS
                 ):
-                    rrf_scores[chunk_id] *= 1.5
 
-        # ==============================================================
-        # 6. SORT BY FINAL SCORE
-        # ==============================================================
+                    final_scores[
+                        chunk_id
+                    ] *= 1.5
+
+        # ==========================================================
+        # 8. SORT
+        # ==========================================================
 
         sorted_chunks = sorted(
-            rrf_scores.items(),
+            final_scores.items(),
             key=lambda item: item[1],
             reverse=True,
         )
 
-        # ==============================================================
-        # 7. FILE DIVERSITY
-        # ==============================================================
+        # ==========================================================
+        # 9. FILE DIVERSITY
+        # ==========================================================
 
-        final_results: List[Dict[str, Any]] = []
+        final_results: List[
+            Dict[str, Any]
+        ] = []
 
-        file_counts: Dict[str, int] = {}
+        file_counts: Dict[
+            str,
+            int,
+        ] = {}
 
         deferred_results = []
 
-        for chunk_id, score in sorted_chunks:
+        for chunk_id, score in (
+            sorted_chunks
+        ):
 
-            chunk = doc_map.get(chunk_id)
+            chunk = doc_map.get(
+                chunk_id
+            )
 
             if not chunk:
                 continue
 
-            file_key = self._get_file_key(chunk)
-
-            current_count = file_counts.get(
-                file_key,
-                0,
+            file_key = (
+                self._get_file_key(
+                    chunk
+                )
             )
 
-            enriched_chunk = dict(chunk)
+            current_count = (
+                file_counts.get(
+                    file_key,
+                    0,
+                )
+            )
 
-            enriched_chunk["combined_score"] = round(
+            enriched_chunk = dict(
+                chunk
+            )
+
+            enriched_chunk[
+                "combined_score"
+            ] = round(
                 score,
                 6,
             )
@@ -616,9 +1170,14 @@ class HybridRetriever:
                 [],
             )
 
-            if current_count < self.max_per_file:
+            if (
+                current_count
+                < self.max_per_file
+            ):
 
-                file_counts[file_key] = (
+                file_counts[
+                    file_key
+                ] = (
                     current_count + 1
                 )
 
@@ -635,104 +1194,189 @@ class HybridRetriever:
                     )
                 )
 
-            if len(final_results) >= top_k:
+            if (
+                len(final_results)
+                >= top_k
+            ):
                 break
 
-        # ==============================================================
-        # 8. FALLBACK
-        # ==============================================================
+        # ==========================================================
+        # 10. FALLBACK
+        # ==========================================================
 
-        if len(final_results) < top_k:
+        if (
+            len(final_results)
+            < top_k
+        ):
 
-            for chunk, _score in deferred_results:
+            for chunk, _score in (
+                deferred_results
+            ):
 
-                if len(final_results) >= top_k:
+                if (
+                    len(final_results)
+                    >= top_k
+                ):
                     break
 
-                final_results.append(chunk)
+                final_results.append(
+                    chunk
+                )
 
-        # ==============================================================
-        # 9. FINAL RANK METADATA
-        # ==============================================================
+        # ==========================================================
+        # 11. FINAL RANK
+        # ==========================================================
 
         for index, result in enumerate(
             final_results,
             start=1,
         ):
-            result["final_rank"] = index
 
-        # ==============================================================
-        # 10. DEBUG RETRIEVAL
-        # ==============================================================
+            result[
+                "final_rank"
+            ] = index
 
-        print("\n========== RETRIEVAL DEBUG ==========")
-        print("QUERY:", query)
+        # ==========================================================
+        # 12. DEBUG
+        # ==========================================================
 
-        print("\n--- QUERY TOKENS ---")
-        print(self._get_graph_tokens(query))
+        print(
+            "\n========== RETRIEVAL DEBUG =========="
+        )
 
-        print("\n--- VECTOR RESULTS ---")
+        print(
+            "QUERY:",
+            query,
+        )
+
+        print(
+            "DETECTED INTENT:",
+            self._detect_code_intent(query),
+        )
+
+        print(
+            "\n--- QUERY TOKENS ---"
+        )
+
+        print(
+            self._get_graph_tokens(
+                query
+            )
+        )
+
+        print(
+            "\n--- VECTOR RESULTS ---"
+        )
 
         for i, chunk in enumerate(
-            vector_chunks[:15],
+            vector_chunks[:30],
             start=1,
         ):
+
             print(
                 i,
                 "|",
-                chunk.get("chunk_id"),
+                chunk.get(
+                    "chunk_id"
+                ),
                 "| class=",
-                chunk.get("class_name"),
+                chunk.get(
+                    "class_name"
+                ),
                 "| method=",
-                chunk.get("method_name"),
+                chunk.get(
+                    "method_name"
+                ),
                 "| score=",
-                chunk.get("score"),
+                chunk.get(
+                    "score"
+                ),
             )
 
-        print("\n--- GRAPH RESULTS ---")
+        print(
+            "\n--- GRAPH RESULTS ---"
+        )
 
         for i, chunk in enumerate(
             graph_chunks[:15],
             start=1,
         ):
+
             print(
                 i,
                 "|",
-                chunk.get("chunk_id"),
+                chunk.get(
+                    "chunk_id"
+                ),
                 "| class=",
-                chunk.get("class_name"),
+                chunk.get(
+                    "class_name"
+                ),
                 "| method=",
-                chunk.get("method_name"),
+                chunk.get(
+                    "method_name"
+                ),
                 "| match_score=",
-                chunk.get("graph_match_score"),
+                chunk.get(
+                    "graph_match_score"
+                ),
                 "| matched_tokens=",
-                chunk.get("graph_matched_tokens"),
+                chunk.get(
+                    "graph_matched_tokens"
+                ),
             )
 
-        print("\n--- FINAL RESULTS ---")
+        print(
+            "\n--- FINAL RESULTS ---"
+        )
 
         for i, chunk in enumerate(
             final_results,
             start=1,
         ):
+
             print(
                 i,
                 "|",
-                chunk.get("chunk_id"),
+                chunk.get(
+                    "chunk_id"
+                ),
                 "| class=",
-                chunk.get("class_name"),
+                chunk.get(
+                    "class_name"
+                ),
                 "| method=",
-                chunk.get("method_name"),
+                chunk.get(
+                    "method_name"
+                ),
                 "| combined_score=",
-                chunk.get("combined_score"),
+                chunk.get(
+                    "combined_score"
+                ),
+                "| vector_score=",
+                chunk.get(
+                    "vector_score"
+                ),
+                "| semantic_score=",
+                chunk.get(
+                    "semantic_score"
+                ),
                 "| sources=",
-                chunk.get("sources"),
+                chunk.get(
+                    "sources"
+                ),
                 "| vector_rank=",
-                chunk.get("vector_rank"),
+                chunk.get(
+                    "vector_rank"
+                ),
                 "| graph_rank=",
-                chunk.get("graph_rank"),
+                chunk.get(
+                    "graph_rank"
+                ),
             )
 
-        print("====================================\n")
+        print(
+            "====================================\n"
+        )
 
         return final_results
